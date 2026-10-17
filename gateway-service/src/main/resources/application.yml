@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: gateway-service
+  config:
+    import: optional:configserver:http://localhost:8050
+  cloud:
+    config:
+      enabled: true
+      uri: http://localhost:8050
+      # 用逗号分隔，列出所有要加载的配置文件基础名
+      name: gateway-service, gateway-service-routes
+      username: config
+      password: config123

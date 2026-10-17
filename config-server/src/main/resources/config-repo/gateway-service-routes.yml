@@ -1,0 +1,96 @@
+spring:
+  cloud:
+    gateway:
+      routes:
+        # 1. 数据源服务 API 路由
+        - id: route-data-source-api
+          uri: lb://data-source-service
+          predicates:
+            - Path=/api/data-source/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+
+        # 2. 数据源服务健康检查路由
+        - id: route-data-source-health
+          uri: lb://data-source-service
+          predicates:
+            - Path=/api/data-source/actuator/**
+          filters:
+            - StripPrefix=2
+            - RewritePath=/api/data-source/actuator/(?<segment>.*), /actuator/${segment}
+
+        # 3. 任务管理服务 API 路由
+        - id: route-task-management-api
+          uri: lb://task-management-service
+          predicates:
+            - Path=/api/task/**
+          filters:
+            - StripPrefix=0
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 20
+                redis-rate-limiter.burstCapacity: 40
+
+        # 4. 数据抽取服务 API 路由
+        - id: route-data-extraction-api
+          uri: lb://data-extraction-service
+          predicates:
+            - Path=/api/extraction/**
+          filters:
+            - StripPrefix=2
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 15
+                redis-rate-limiter.burstCapacity: 30
+
+        # 5. 数据转换服务 API 路由
+        - id: route-data-transformation-api
+          uri: lb://data-transformation-service
+          predicates:
+            - Path=/api/transformation/**
+          filters:
+            - StripPrefix=2
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 15
+                redis-rate-limiter.burstCapacity: 30
+
+        # 6. 数据存储服务 API 路由
+        - id: route-data-storage-api
+          uri: lb://data-storage-service
+          predicates:
+            - Path=/api/storage/**
+          filters:
+            - StripPrefix=2
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 15
+                redis-rate-limiter.burstCapacity: 30
+
+        # 7. 用户服务认证路由（登录/登出/刷新，不剥前缀，user-service 即为 /api/auth）
+        - id: route-user-auth
+          uri: lb://user-service
+          predicates:
+            - Path=/api/auth/**
+
+        # 8. 用户/角色管理路由
+        - id: route-user-management
+          uri: lb://user-service
+          predicates:
+            - Path=/api/users/**,/api/roles/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+
+        # 9. 网关自身健康检查路由（网关直接处理，不转发）
+        - id: route-gateway-actuator
+          uri: no://op
+          predicates:
+            - Path=/actuator/**
+          filters: []   # 无过滤器，由网关自身处理

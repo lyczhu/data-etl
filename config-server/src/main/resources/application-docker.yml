@@ -1,0 +1,34 @@
+server:
+  port: 8050
+
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        native:
+          search-locations: classpath:/config-repo
+        default-label: main
+  profiles:
+    active: native
+  security:
+    user:
+      name: config
+      password: config123
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://registry:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,env,refresh
+  endpoint:
+    health:
+      show-details: always

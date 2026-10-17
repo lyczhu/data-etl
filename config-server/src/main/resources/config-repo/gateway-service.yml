@@ -1,0 +1,97 @@
+server:
+  # 修复：原 8081 与 data-source-service 端口冲突，网关改用 8080
+  port: 8080
+
+spring:
+  application:
+    name: gateway-service
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+    register-with-eureka: true
+    fetch-registry: true
+  instance:
+    prefer-ip-address: true
+    instance-id: ${spring.application.name}:${server.port}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,refresh,gateway
+  endpoint:
+    health:
+      show-details: always
+    prometheus:
+      enabled: true
+    gateway:
+      enabled: true
+  health:
+    redis:
+      enabled: true
+    db:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10000
+        permitted-number-of-calls-in-half-open-state: 3
+        slow-call-duration-threshold: 2000
+        slow-call-rate-threshold: 50
+    instances:
+      dataSourceCircuitBreaker:
+        base-config: default
+      taskManagementCircuitBreaker:
+        base-config: default
+      dataExtractionCircuitBreaker:
+        base-config: default
+      dataTransformationCircuitBreaker:
+        base-config: default
+      dataStorageCircuitBreaker:
+        base-config: default
+      userCircuitBreaker:
+        base-config: default
+
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 3s
+    instances:
+      dataSourceCircuitBreaker:
+        timeout-duration: 5s
+      taskManagementCircuitBreaker:
+        timeout-duration: 5s
+
+logging:
+  level:
+    root: INFO
+    org.springframework.cloud.gateway: DEBUG
+    com.lawyus.dataetl.gateway: DEBUG
+
+# 新增：网关统一 JWT 鉴权（修复“鉴权闭环缺失”）
+# secret 必须与 user-service 签发 token 的密钥一致
+jwt:
+  secret: dataetl-secret-key-for-jwt-token-generation-and-validation-must-be-at-least-256-bits
+
+gateway:
+  security:
+    # 白名单（Ant 风格）：不需 token 即可访问的路径
+    whitelist:
+      - /api/auth/**
+      - /actuator/**
+      - /error

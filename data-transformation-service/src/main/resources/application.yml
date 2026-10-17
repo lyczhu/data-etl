@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: data-transformation-service
+  config:
+    import: optional:configserver:http://localhost:8050
+  cloud:
+    config:
+      username: config
+      password: config123
+
+server:
+  port: 8084
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,refresh
+  endpoint:
+    prometheus:
+      enabled: true
+    refresh:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}

@@ -1,0 +1,79 @@
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+.pom-release-bak
+.pom.xml.versionsBackup
+pom.xml.tag
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+*.kotlin
+
+# IDE - IntelliJ IDEA
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+
+# IDE - Eclipse/STS
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+# IDE - NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# IDE - VS Code
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Application config
+# 默认跟踪所有 .yml（含 docker-compose 与各服务 / Config 配置）
+application-local.yml
+application-dev.yml
+application-prod.yml
+
+# Monitoring runtime data（配置仍纳入版本控制，只忽略运行时产物）
+monitoring/grafana/data/
+monitoring/alert-logs/
+
+# Temp / diagnostic artifacts
+*~
+*.tmp
+arthas-output/
+
+# Docs
+docs/
+
+# Node (for frontend in same repo)
+node_modules/
+
+# Trae
+/.trae/
+
+# Workbuddy
+.workbuddy/
+
+# qoder
+.qoder/

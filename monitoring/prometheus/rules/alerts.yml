@@ -1,0 +1,40 @@
+groups:
+  - name: etl-instance-alerts
+    rules:
+      - alert: InstanceDown
+        expr: up{job="spring-actuator"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Instance {{ $labels.instance }} down"
+          description: "Target {{ $labels.instance }} for job={{ $labels.job }} is down (no scraping)"
+
+      - alert: ServiceDown
+        expr: up{job="spring-actuator"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Spring service down"
+          description: "One or more spring-actuator targets are not responding for more than 2 minutes."
+
+  - name: etl-node-exporter-alerts
+    rules:
+      - alert: NodeHighCPU
+        expr: 1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.8
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage > 80% for 2 minutes on {{ $labels.instance }}"
+
+      - alert: NodeHighDiskUsage
+        expr: (node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}) / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High disk usage on {{ $labels.instance }}"
+          description: "Disk usage > 85% for more than 5 minutes on {{ $labels.instance }}"

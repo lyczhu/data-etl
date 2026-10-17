@@ -1,0 +1,54 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "--- Grafana ---",
+        "enable": true,
+        "hide": true,
+        "iconColor": "#000000",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Spring services up",
+      "targets": [
+        {
+          "expr": "sum(up{job=\"spring-actuator\"}) by (job)",
+          "format": "time_series",
+          "instant": true
+        }
+      ],
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4}
+    },
+    {
+      "type": "graph",
+      "title": "Node CPU Usage (avg)",
+      "targets": [
+        {
+          "expr": "100 * (1 - avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))",
+          "format": "time_series"
+        }
+      ],
+      "gridPos": {"x": 6, "y": 0, "w": 12, "h": 6}
+    },
+    {
+      "type": "graph",
+      "title": "Disk Usage (%)",
+      "targets": [
+        {
+          "expr": "100 * (node_filesystem_size_bytes{fstype!~\"tmpfs|overlay\"} - node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay\"}) / node_filesystem_size_bytes{fstype!~\"tmpfs|overlay\"}",
+          "format": "time_series"
+        }
+      ],
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 6}
+    }
+  ],
+  "title": "ETL System Overview",
+  "schemaVersion": 27,
+  "version": 1
+}

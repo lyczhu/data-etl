@@ -1,0 +1,64 @@
+server:
+  port: 8085
+
+spring:
+  application:
+    name: data-storage-service
+  datasource:
+    url: jdbc:postgresql://localhost:5433/etl_system?reWriteBatchedInserts=true
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  redis:
+    host: localhost
+    port: 6379
+    password:
+  kafka:
+    bootstrap-servers: localhost:9092
+    listener:
+      type: batch
+    properties:
+      client.dns.lookup: resolve_canonical_bootstrap_servers_only
+    consumer:
+      group-id: data-storage-group
+      auto-offset-reset: earliest
+      max-poll-records: 100
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+task:
+  management:
+    service:
+      url: http://localhost:8082
+
+etl:
+  topics:
+    data-transformation: transformed-data
+    task-completed: task-completed
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}

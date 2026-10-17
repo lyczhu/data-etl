@@ -1,0 +1,59 @@
+server:
+  port: 8084
+
+spring:
+  application:
+    name: data-transformation-service
+  datasource:
+    url: jdbc:postgresql://localhost:5433/etl_system
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  kafka:
+    bootstrap-servers: localhost:9092
+    listener:
+      type: batch
+    properties:
+      client.dns.lookup: resolve_canonical_bootstrap_servers_only
+    consumer:
+      group-id: data-transformation-group
+      auto-offset-reset: earliest
+      max-poll-records: 100
+    producer:
+      properties:
+        linger.ms: 10
+        batch.size: 262,144   # 256KB
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+etl:
+  topics:
+    data-extraction: raw-data
+    data-transformation: transformed-data
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}

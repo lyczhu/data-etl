@@ -1,0 +1,87 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: data-extraction-service
+  datasource:
+    url: jdbc:postgresql://localhost:5433/etl_system
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  redis:
+    host: localhost
+    port: 6379
+    password:
+  kafka:
+    bootstrap-servers: localhost:9092
+    properties:
+      client.dns.lookup: resolve_canonical_bootstrap_servers_only
+    consumer:
+      group-id: data-extraction-group
+      # earliest 会在重启时重放；要求消费者侧具备幂等处理能力
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      max-poll-records: 500
+      session-timeout-ms: 30000
+      heartbeat-interval-ms: 10000
+    producer:
+      properties:
+        linger.ms: 10
+        batch.size: 262144   # 256KB
+        acks: all
+        retries: 3
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+data:
+  source:
+    service:
+      url: http://localhost:8081
+  extract:
+    batch-size: 1000
+
+etl:
+  topics:
+    task-request: task-request
+    data-extraction: raw-data
+    task-failed: task-failed
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+
+# 动态数据源连接池配置
+datasource:
+  dynamic:
+    max-pool-size: 10
+    min-idle: 2
+    connection-timeout: 30000
+    idle-timeout: 600000
+    max-lifetime: 1800000
+    keepalive-time: 300000
+    leak-detection-threshold: 60000
+    max-cache-size: 50
