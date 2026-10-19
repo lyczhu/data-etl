@@ -17,6 +17,11 @@ spring:
       auto-offset-reset: earliest
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # 一条 dispatch = 一个 shard；一次只取一条，避免长分片阻塞 poll。
+      max-poll-records: 1
+      properties:
+        # 长分片仍在同一 listener 线程执行；先放宽到 30m，Phase 1A 再切异步 + pause/resume。
+        max.poll.interval.ms: 1800000
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
@@ -24,9 +29,14 @@ spring:
         linger.ms: 10
         batch.size: 262144
         compression.type: zstd
+    listener:
+      # 3 个并发消费者可同时处理 3 个 shard；同一 shard 的重复投递由 checkpoint/幂等兜底。
+      concurrency: 3
+      ack-mode: record
 
 server:
-  port: 8086
+  # user-service 占用 8086；worker 改用 8087。
+  port: 8087
 
 eureka:
   client:

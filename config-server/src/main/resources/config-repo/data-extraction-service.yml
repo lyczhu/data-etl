@@ -58,6 +58,9 @@ etl:
     task-request: task-request
     data-extraction: raw-data
     task-failed: task-failed
+  legacy:
+    # 旧链路 Redis 状态键是展示缓存，不是 completion 真源；保留 24h 便于排查后自动回收。
+    redis-status-ttl-hours: 24
 
 management:
   endpoints:

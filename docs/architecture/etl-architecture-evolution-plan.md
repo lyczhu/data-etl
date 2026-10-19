@@ -1,247 +1,470 @@
-# ETL 架构演进方案：从四段 Kafka 流水线到"编排器 + In-Process Worker"
+# ETL 架构演进计划 v2：先修数据面，再收控制面
 
-> 产出方式：`system-modeler`（结构与边界）+ `flow-visualizer`（端到端流程）+ `risk-quality-reviewer`（问题清单）+ `evolution-planner`（目标架构与迁移路线）。
-> 视图状态：现状为 **current-state**（代码/配置直接证据），目标为 **target/proposed**（显式标注）。
-> 配套现状图：`architecture-container-view.dot`、`etl-task-lifecycle-flow.dot`；目标态图：`target-container-view.dot`、`target-lifecycle-states.dot`、`target-dataflow.dot`。
-> 补充件（H~M 风险 + 业界选型）：`risk-addendum-and-tech-selection.md`、`risk-tech-selection-matrix.dot`。
-> 详细设计：`orchestrator-design.md`（状态机 + 守护规则 + outbox + sweeper，已补齐 §3/§4 的缺口与不一致）。
-> 渲染：`dot -Tsvg xxx.dot -o xxx.svg`。
-
-## 摘要
-
-针对当前 data-etl 的 4 阶段 Kafka 流水线，把 E/T/L 合并为单一 **in-process worker**，引入轻量 **编排器 + 显式状态机 + checkpoint/事务日志**，Kafka 退居任务分发与流式通道；分四阶段渐进迁移，覆盖 MySQL/PG、NoSQL、JSON/CSV/GeoJSON、IoT 与批/流两种模式，直击"链路长、中间失败难定位、是否结束难判断、失败恢复难"四大痛点。规模假设：单团队、单表 ≤ 30M 行、并发任务 ≤ 20，避免为微服务而微服务。
+> 版本：v2.0（2026-10-19）
+> 状态：**有条件推进**。`etl.routing.new-worker` 保持 `false`，直到 Gate 1（数据面正确性）通过。
+> 团队假设：10 人（控制面 2、数据面 3、平台/安全 2、测试 2、产品/运维 1）；关键路径不因加人而压缩。
+> 依据：`etl-architecture-review-2026-10-19.md`（下称“评审报告”）、当前 `task-management-service`/`etl-worker`/`etl-connector-spi`/`db/schema`/`config-repo` 的实际实现。
+> 文档关系：`orchestrator-design.md` 仍是状态机与迁移边的权威契约；本计划只调整**阶段顺序、范围、验收门槛**，不推翻已实现的 12 态/32 边。v1 内容见 git 历史。
+> 视图状态：现状为 current-state（代码/配置直接证据）；目标为 target/proposed（显式标注）。
 
 ---
 
-## 1. 当前架构与问题清单
+## 0. 执行摘要
 
-### 1.1 现有端到端流程（current-state，高置信）
+### 0.1 结论
 
-见 `etl-task-lifecycle-flow.dot`、`architecture-container-view.dot`。
+- **继续架构方向**：E/T/L 合并为 in-process worker、checkpoint 作为真源、单一 `transition()` 入口、DB 约束优先，这些方向保留。
+- **不按 v1 直接进入生产灰度**：评审报告中的 P0-1～P0-8 未关闭前，`newWorker=true` 只允许在实验室/测试环境使用。
+- **先修数据面，再收控制面**：Phase 1 的第一优先级不是继续扩状态机，而是“全量派工 + 原子 checkpoint + 可续跑 + 幂等 + 重试/DLT + 安全”。
+- **Phase 1A 前 2 周内做一次技术路线决策**：自研 worker 的可靠性部分能否在可控成本内达到 Gate 1；否则用 Spring Batch 承担 chunk/restart/skip/retry/partition，或用 Temporal 承担退避/超时/取消/历史。
 
-- **控制流**：`POST /api/tasks` → `etl_task.status='new'` → `TaskScheduler` 每 30s 扫描（Redisson 锁 `task:scheduler:lock`）→ Feign 拿数据源 → 反射建目标表（`TaskScheduler.generateCreateTableSql`）→ 发 Kafka `task-request`（key=taskId）→ `status='running'`。
-- **数据流**（每行一条 Kafka 消息，taskId 作 key）：`task-request` → `data-extraction-service`（`MIN/MAX/COUNT` + `WHERE id>=? LIMIT 1000` 顺序游标，逐行 `send` 到 `raw-data`）→ `data-transformation-service`（batch 监听 + CompletableFuture 并行、`send().get()` 同步发送）→ `data-storage-service`（每行一次 Feign 取表名 → 拼 INSERT → 每行 `HINCRBY completedRecords`；`>=totalRecords` 时发 `task-completed`）。
-- **回写**：`TaskCompletedListener` 置 `completed`；`data-extraction-service/.../KafkaConfig.java:73-98` 在重试耗尽后发 `task-failed`，`EtlTaskService.markFailed` 回滚非终态。
-- **状态字面量**（`EtlTask.status` 为 `String`）：`new/processing/running/completed/failed`——无枚举、无终态保护、无 attempt 概念。
+### 0.2 v1 的三个最致命阻断
 
-### 1.2 问题清单（按痛点归组，H~M 详见 `risk-addendum-and-tech-selection.md`）
+1. **派工不完整**：`DispatchService` 只派首批 `permitsPerRun=8` 个分片，run 进入 `DISPATCHED/RUNNING` 后不再补派；30M 行/5000～6000 分片只会跑前 8 片。
+2. **断点不可续**：`last_cursor` 不按 chunk 写入，worker 不读 `resumeCursor`；数据写入与 checkpoint 不在同一事务，重试会重复写且 G-4 可能看不出来。
+3. **失败不可处置**：没有 `ErrorClassifier`、没有自动 T12 重试、worker 不生产 DLT；`rowsDropped` 混用，坏行/丢数仍可能被判 `SUCCEEDED`。
 
-| # | 痛点 | 严重度 | 现象 / 证据 |
-|---|---|---|---|
-| A1 | 链路长 | P0 | 一行数据跨 4 服务 + 3 次 Kafka + 2 次 Feign |
-| A2 | 链路长 | P0 | 单行消息 + 单行 Feign + 单行 INSERT → task-mgmt Full GC 风暴 52 次/均值 94ms（`performance-analysis.md §2`） |
-| A3 | 链路长 | P1 | 无分片并行，README 承诺的"主键范围分片 + CompletableFuture"现代码不存在 |
-| B1 | 中间失败难定位 | P0 | traceId 未贯通；日志无 taskId/shardId MDC；业务埋点未落地 |
-| B2 | 中间失败难定位 | P0 | 5 个 topic 无 DLT，仅 extraction 侧有 `FixedBackOff(1000,3)` |
-| B3 | 中间失败难定位 | P1 | 目标表无主键/索引（`generateCreateTableSql`） |
-| C1 | 结束难判断 | P0 | 完成判定依赖 Redis Hash + `task-completed`，键无 TTL、丢失即永卡 running |
-| C2 | 结束难判断 | P0 | `completedRecords >= totalRecords` 中 `totalRecords` 来自 `COUNT(*)` 快照，源表并发写即两边不等 |
-| C3 | 结束难判断 | P2 | 无 attempt/run 概念，`earliest` 重放与"是否已完成"混淆 |
-| D1 | 失败恢复难 | P0 | 无 checkpoint 表；重试=从头再抽；无"仅重跑失败分片" |
-| D2 | 失败恢复难 | P0 | 目标表无 PK → 无法幂等；去重靠 Redis 24h TTL |
-| D3 | 失败恢复难 | P1 | 仅 extraction 有 `task-failed`；transformation/storage 失败仅吞异常 |
-| D4 | 失败恢复难 | P1 | 无人工干预入口；无 `CANCELLED`/`PARTIAL_SUCCESS` |
-| E1 | 接入面窄 | P0 | 仅 JDBC；Mongo/文件(JSON/CSV/GeoJSON)/IoT 全缺位 |
-| E2 | 接入面窄 | P0 | 无流式管道；IoT/CDC 只能伪装成 batch |
-| F1 | 微服务过度 | P1 | E/T/L 三服务技术栈/团队/扩缩需求一致，拆开只增运维面 |
-| F2 | 微服务过度 | P2 | 转换默认规则仅"数值保留 2 位小数"，不需独立部署 |
+### 0.3 v2 的七个变化
 
-> 另有 H（数据正确性）、I（并行度天花板，taskId 分区键杀死单任务并行）、J（安全/凭据明文）、K（单点/运维）、L（契约）、M（治理）六类补充问题，见补充件。
-
----
-
-## 2. 推荐总体架构（target-state）
-
-配套图：`target-container-view.dot`。
-
-### 2.1 服务合并/保留决策
-
-| 现状服务 | 决策 | 目标形态 | 依据 |
-|---|---|---|---|
-| registry / config-server / gateway / user-service | 保留 | 不动，仅补 tracing propagation 与限流阈值 | 边界清晰，替换成本高 |
-| data-source-service | 保留（瘦身为纯元数据 CRUD） | 增加 `connectorType`/`connectionSchema` 支持非 JDBC 源 | 变更频率与主链路解耦 |
-| task-management-service | 升级为 `etl-orchestrator` | 显式状态机 + `etl_task_run`/`etl_task_checkpoint`/`etl_task_dlt`；暴露 submit/cancel/retry/resume；仅编排不处理数据 | 直接解 B/C/D |
-| data-extraction + data-transformation + data-storage | 合并为一个 `etl-worker`（同 jar，profile 分批/流） | E→T→L 全进程内串成 pipeline，Kafka 仅分发与回报，不穿越数据面 | 解 A/B/C/D/F；无独立伸缩诉求 |
-| — | 新增 `etl-stream-runtime`（`etl-worker` 的 stream profile） | 常驻消费者处理 IoT/CDC/文件监听 | 解 E2 |
-| — | 新增 `connector-spi` 模块（jar，非服务） | 统一 Source/Sink 接口，Jdbc/Mongo/File/IoT 各一实现 | 解 E1，避免"每种源一个新微服务" |
-
-关键取舍：**不引入 Spring Batch、不引入 SeaTunnel/DolphinScheduler/Airflow**——数据量 2~3 千万、单团队、需精细几何/PostGIS/GeoJSON 处理，用"状态机 + checkpoint 表"自实现编排语义更省维护成本。若后续 > 500 并发或需跨节点 DAG，再评估切 Airflow/DolphinScheduler，接口预留 `OrchestratorEngine` 抽象即可。（业界选型对照见 `risk-addendum-and-tech-selection.md §2`。）
-
-### 2.2 控制面 / 数据面 / 流面
-
-- **控制面**：gateway → orchestrator（原 task-mgmt :8082）；orchestrator ↔ data-source（元数据）；orchestrator ↔ PostgreSQL（`etl_task`/`etl_task_run`/`etl_task_checkpoint`/`etl_task_dlt`）；orchestrator 生产 `etl.task.dispatch.batch`、消费 `progress`/`results`/`dlt`。
-- **数据面**：`etl-worker`（profile=batch，可扩 1~N）从 `dispatch.batch` 拉活，进程内 `SourceReader → TransformerChain → SinkWriter`；每 shard 提交 checkpoint；批结束发 `results`。
-- **流面**：`etl-worker`（profile=stream）从 `source.iot.*`/`source.file.*` 拉，走同一 SPI 到 sink，发心跳/指标到 orchestrator。
-- **Redis 收缩**：只保留分布式锁 + 热点缓存（源表元数据、target-table-name），不再作完成判定唯一真源。
-
----
-
-## 3. 任务全生命周期状态模型
-
-> 本节为**概要**。逐状态的语义/SLA/超时动作、32 条合法迁移边、行数对账推导、sweeper 判定树与决策记录，见 `orchestrator-design.md`（§3–§8）；`target-lifecycle-states.dot` 已按该文档修订并重新渲染 SVG。
-
-配套图：`target-lifecycle-states.dot`。
-
-### 3.1 状态集合（`EtlTaskStatus` 枚举，取代字面量）
-
-`CREATED`, `VALIDATED`, `QUEUED`, `DISPATCHED`, `RUNNING`, `PARTIAL_SUCCESS`, `RETRYING`, `NEEDS_ATTENTION`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `SUPERSEDED`
-
-- **`etl_task`**：任务定义 + "最新一次运行汇总视图"。
-- **`etl_task_run`**（target 新表）：每次执行一条，`runId, taskId, attemptNo, status, startedAt, finishedAt, stats, errorSummary`；`etl_task.status` 派生自最新 run。
-- **`etl_task_checkpoint`**（target 新表）：`(taskId, runId, shardId)` 主键，`lastCursor/lastOffset/lastPk, rowsIn, rowsOut, status, updatedAt`；断点续传唯一真源。
-
-### 3.2 迁移与守护规则（集中在 `OrchestratorService.transition(taskId, from, to, reason)`，禁止散点 `task.setStatus(...)`）
-
-1. 终态（SUCCEEDED/FAILED/CANCELLED/SUPERSEDED）不可回退；NEEDS_ATTENTION 仅经 `/retry` 或 `/resume` API 迁出。
-2. RUNNING → PARTIAL_SUCCESS 要求 checkpoint 存在 FAILED 分片且其余分片 SUCCEEDED。
-3. DISPATCHED → RUNNING 由 worker 首次心跳确认；60s 无心跳 → 回退 QUEUED 且 `attemptNo+1`，避免"派了没 worker 领"死锁。
-4. RUNNING → SUCCEEDED 必须"所有 shard checkpoint=SUCCEEDED 且 rowsOut 汇总 == rowsIn 汇总 - rowsDropped"——以分片游标实读行数取代 `COUNT(*)` 快照，修复 C2。
-5. CANCELLED：orchestrator 发 `etl.task.commands`，worker 完成当前 chunk 后停并落 checkpoint；支持后续 `/resume`。
-
----
-
-## 4. 失败处置机制
-
-| 机制 | 方案 | 关键点 |
+| # | 变化 | 原因 |
 |---|---|---|
-| 重试策略 | 三段式：瞬态（网络/锁/超时）分片内指数退避+抖动 ≤3；持续性任务级 `attemptNo+1` 退避 5min/15min/1h ≤3；永久性（schema 不匹配/脏数据）立即 DLT 不重试 | `ErrorClassifier`（Retryable/Transient/Fatal）替换 `DataStorageService:150-164` 盲重试 |
-| 补偿/人工干预 | `POST /api/tasks/{taskId}/retry?shards=failed&from=checkpoint`、`/cancel`、`/mark-succeeded-with-data-loss`；操作写 `etl_task_audit` | 解 D4 |
-| 幂等键 | `idempotencyKey = sha256(taskId+runId+sourceUri+shardId+rowPk)`；目标表加 `idempotency_key UNIQUE`/PK；`INSERT ... ON CONFLICT DO UPDATE/NOTHING` | `generateCreateTableSql` 必须补 PK/唯一索引 |
-| 去重 | 主：DB 唯一约束（不依赖 Redis）；副：Redis 布隆过滤器热路径预筛，DB 兜底 | 解 D2、兑现 README |
-| 断点续传 | worker 每 chunk（默认 5k 行）事务提交：① 目标表 batchUpsert ② checkpoint upsert ③ outbox 插入；Kafka 由 poller 从 outbox 投递（**Transactional Outbox**） | 避免"数据已提交但 progress 丢失"；解 C1/C2/D1 |
-| 毒消息 DLT | `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` → `etl.task.dlt` + `etl_task_dlt`（rawPayload/errorClass）；DLT 非空即 NEEDS_ATTENTION | 三处 KafkaConfig 升级统一模板 |
-| 失败可见性 | `run.errorSummary` 存首个致命异常 stack 前 2KB + shard 列表；`GET /api/tasks/{taskId}/runs/{runId}/failures` | 解 B1 |
+| 1 | Phase 1 范围缩为“数据面正确性 gate” | 控制面已足够复杂，数据面未达标 |
+| 2 | 目标表 PK/幂等/upsert 提前到 Phase 1 | 没有 PK 的重试必然重复 |
+| 3 | 明确提交边界（同库同事务/跨库幂等重放），chunk 级游标 | “断点续传唯一真源”必须可读可写，且不能假设跨库 2PC |
+| 4 | 分片数按并行度定，chunk 只做事务单元 | 30M/5k=6000 分片会超过上限并放大控制面 |
+| 5 | 全局许可改为 DB 计数/分布式信号量 | JVM `Semaphore` 不是全局、不抗重启 |
+| 6 | 派工 key 改为 `runId+shardId`，worker 配置并发 | 修复 I1“taskId 分区键杀死单任务并行” |
+| 7 | 灰度按 dataSource，shadow compare 真正落地 | 全局布尔开关无法灰度/回滚 |
+
+### 0.4 不改变的内容
+
+- 12 个 run 状态、32 条合法迁移边、`OrchestratorService.transition()` 单一入口。
+- `etl_task_run` / `etl_task_checkpoint` 三层模型与现有 DDL 05/06。
+- 4 个 sweeper 的骨架（但需要补收敛检查、lease/fencing、DB 许可）。
+- Phase 0 已完成的堆内存、storage 真批、Caffeine、Sleuth、指标与慢查询配置。
+- `etl.routing.new-worker` 作为总开关；新增 dataSource 白名单作为灰度细粒度。
 
 ---
 
-## 5. 数据流设计
+## 1. 现状基线（current-state）
 
-配套图：`target-dataflow.dot`。
+### 1.1 当前运行模式
 
-### 5.1 Kafka topic 重规划（target）
+- 生产默认仍走旧链路：`EtlTaskService` 建 `status='new'` → `TaskScheduler` 扫描 → 发 `task-request` → 旧 E/T/L 三服务 → Redis 计数 → `task-completed/task-failed` 回写。
+- 新链路已实现但默认休眠：`etl.routing.new-worker=false`（`config-repo/task-management-service.yml`）。
+- 新链路组件：`EtlTaskStatus`、`AllowedTransitions`、`GuardChain`、`OrchestratorService`、4 个 sweeper、`DispatchService`、`ProgressListener/ResultsListener/DltListener`、`RunValidator`、`etl-worker`、`etl-connector-spi`。
 
-| Topic | 分区 | 保留 | 生产 | 消费 | 用途 |
-|---|---|---|---|---|---|
-| `etl.task.commands` | 12 | 7d | orchestrator | worker/stream | 取消/暂停/恢复，key=taskId |
-| `etl.task.dispatch.batch` | 24 | 7d | orchestrator | worker | 分片级派工，一 shard 一消息 |
-| `etl.task.dispatch.stream` | 按源 | 7d | — | stream（静态分配） | 流任务注册（可选直连源 topic） |
-| `etl.task.progress` | 12 | 3d | worker | orchestrator | 心跳/进度（每 shard ≤1/5s） |
-| `etl.task.results` | 12 | 30d | worker | orchestrator | run 终态与统计 |
-| `etl.task.dlt` | 6 | 30d | worker | orchestrator+运维 | 毒消息 |
-| `source.iot.raw.*` | 24+ | 按业务 | 外部 | stream | IoT 直连（MQTT bridge） |
-| `source.file.arrival` | 6 | 7d | 文件监听 | orchestrator | 对象存储事件（MinIO/S3 webhook） |
+### 1.2 已实现 / 未实现
 
-**删除**：`raw-data`、`transformed-data`、`task-completed`、`task-failed`——语义并入 `dispatch/progress/results`。
-
-### 5.2 批处理分片策略（worker profile=batch）
-
-- JDBC：按 `MIN(id)/MAX(id)` 分 N 段，一段一 shard 消息；无 PK 表用 `TABLESAMPLE`/`ctid`；流式游标 fetchSize（MySQL `Integer.MIN_VALUE` / PG 5000）。**分片消息只带 (taskId, runId, shardId, pkFrom, pkTo)，不传整行**。
-- Mongo：`_id` 范围 + `$bucketAggregate` 分片。
-- 文件/对象：CSV 行区间 + gzip offset index；JSON 顶层数组切段/JSON stream；GeoJSON 按 Feature 分片（≤200MB 内存 FeatureIterator，>200MB 落临时 spool）。
-- 默认 chunk 5,000 行，上限 20,000（PostGIS 场景降 2,000 避 `ST_GeomFromText` CPU 尖峰）。
-
-### 5.3 流处理低延迟通道（worker profile=stream）
-
-- 常驻消费 `source.iot.raw.*`，同 SPI：`StreamReader → Decode/Normalize → SinkBuffer → SinkWriter`。
-- 微批：`linger 200ms` 或 `buffer 500` 触发 flush；p95 端到端 < 3s。
-- 按 source 分消费者组水平扩缩；原生 `KafkaConsumer` + `ConsumerRebalanceListener` 管 shard 生命周期；与批任务共用 checkpoint 表（streamId 代 taskId）。
-
-### 5.4 背压与限流
-
-- Worker 拉模型：`concurrency` + `maxPollRecords` + 本地 `Semaphore(activeShards=cpu*2)`；获取失败 → `pause()` 对应 partition。
-- Producer：`linger.ms=10, batch.size=256KB, compression.type=zstd`（现 extraction 已有，扩至所有生产者）。
-- Sink：`autoCommit=false` + `executeBatch()` 每 5k 提交；PG 目标可用 `COPY`（`CopyManager.copyIn`）替代 INSERT。
-- 全局：orchestrator 令牌桶限制"同时 RUNNING 分片数"，护住源库。
-
----
-
-## 6. 可观测性与监控告警
-
-### 6.1 落地清单
-
-- **追踪**：Micrometer Tracing / Spring Cloud Sleuth + OTLP → Jaeger/Tempo；KafkaHeaders 传播 traceId；一次 ETL = 一个 trace，跨 orchestrator/worker/PG/Redis。
-- **指标**（Micrometer，带 taskId/sourceType/pipelineType 标签）：`etl.task.dispatch.count{status}`、`etl.task.duration`(P50/95/99)、`etl.shard.duration{stage}`、`etl.records.{in|out|dropped|deduped}`、`etl.retry.count{errorClass}`、`etl.checkpoint.lag`、`etl.dlt.size`；复用 `kafka_consumer_..._records_lag`。
-- **日志**：JSON encoder + MDC `traceId/spanId/taskId/runId/shardId/attemptNo`；ERROR=触发 DLT/NEEDS_ATTENTION，WARN=分片内重试，INFO=shard 提交。
-- **进度**：唯一真源 = `etl_task_checkpoint`（orchestrator 直查）；Redis 仅活跃分片热缓存 + 展示层短 TTL；UI `GET /api/tasks/{taskId}/progress`。
-
-### 6.2 Grafana 面板（`monitoring/grafana/dashboards/`）
-
-`etl_task_overview.json`、`etl_pipeline_hotpath.json`、`jvm_gc.json`（治 A2）、`postgres_health.json`（慢查询 Top10）。
-
-### 6.3 告警规则（`monitoring/prometheus/rules/alerts.yml`）
-
-| 级别 | 规则 | 阈值 |
+| 能力 | 状态 | 证据 |
 |---|---|---|
-| critical | EtlTaskNeedsAttention | status==NEEDS_ATTENTION 持续 >5min |
-| critical | EtlDltGrowing | `increase(etl_dlt_size_total[10m]) > 20` |
-| warning | EtlTaskStalled | `time()-last_progress_ts > 15*shard_expected` |
-| warning | EtlConsumerLagHigh | lag>5000 持续 10min |
-| warning | JvmFullGcStorm | major GC rate >0.1 |
-| info | EtlTaskSlowRegression | P95 相对 7d 基线 +50% |
+| 12 态 + 32 边 + CAS + 派生投影 | 已实现 | `AllowedTransitions`、`OrchestratorService`、`EtlTaskRunRepository` |
+| `etl_task_run` / `etl_task_checkpoint` DDL | 已实现 | `db/schema/05`、`06` |
+| 4 个 sweeper + 退避策略 | 已实现（有缺口） | `orchestrator/scheduler/*`、`policy/*` |
+| 入口链 submit→validate→plan→queue | 已实现 | `RunValidator`、`ShardPlanner`、`RunPlanWriter` |
+| 派工 pump | 部分实现 | 只派首批 `permitsPerRun`，无补派循环 |
+| worker 进程内 E/T/L | 骨架 | `ShardExecutor`、`JdbcSourceConnector`、`JdbcSinkWriter` |
+| checkpoint 续跑 | **未实现** | 不写 chunk cursor、不读 `resumeCursor` |
+| 数据+checkpoint 原子提交 | **未实现** | Sink 与 Checkpoint 各自连接/事务 |
+| 目标表 PK/幂等/upsert | **未实现** | 普通 INSERT，无 PK/唯一键 |
+| ErrorClassifier/自动重试/DLT 生产 | **未实现** | 无 `ErrorClassifier`；worker 不发 DLT |
+| 人工 API（cancel/retry/resume/abort/failures） | **未实现** | `EtlTaskController` 只有 CRUD |
+| 多源/文件/IoT/stream | **未实现** | SPI 只有 JDBC POSTGRES/MYSQL |
+| 安全（凭据不落 Kafka、DB 加密、JWT 治理） | **未实现** | 派工消息带明文 password；secret 硬编码 |
+| Orchestrator 指标/告警 | 部分 | 只有 Counter；无 Gauge/orchestrator 告警组 |
+| 39 个集成测试 / 58 个单测 | 已存在 | 但 E2E 仅 3 分片/20 行，未覆盖崩溃/续跑/重复 |
 
-### 6.4 PostgreSQL
+### 1.3 完成度校正
 
-`docker-compose.yml` 的 `postgres` 加 `-c log_min_duration_statement=100 -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all`，修复 `performance-analysis.md §1` 空缺。
+v1 文档中“数据面接线已落地”“端到端可运行”“影子切换已落地”等表述需要校正：
+
+| v1 表述 | 代码事实 | v2 口径 |
+|---|---|---|
+| 数据面接线已落地 | 只派首批 8 片；无补派 | **部分实现** |
+| 端到端可运行 | 3 分片/20 行 E2E | **限定规模可用** |
+| 失败处置完备 | 无 retry/DLT | **未实现** |
+| 影子运行比对 | flag 只有 getter/setter | **未实现** |
+| 可观测性闭环 | Phase 0 指标 + 少量日志 | **部分实现** |
 
 ---
 
-## 7. 渐进迁移路线与风险规避
+## 2. 目标架构（target-state）
 
-### 7.1 阶段划分（每阶段可独立回滚）
+### 2.1 设计原则
 
-- **Phase 0 · 观测先行（1~2 周，零业务改动）**：落地 §6.1 追踪/指标/JSON 日志；PG 慢查询参数；task-mgmt 堆 512M→1G；storage `getTargetTableNameFromTaskService` 加 Caffeine 缓存；`storeBatchDataToDatabase` 改真批。回滚=配置/依赖级。
-  - ✅ **已实施（2026-10，全 10 模块 `mvn compile` BUILD SUCCESS）**：task-mgmt 堆 1G；storage 目标表名 Caffeine 缓存 + batch listener 真批 + 单事务切片提交 + 批内去重 + MDC(taskId)；Sleuth 接入 task-mgmt/extraction/transformation/storage 4 服务并加 traceId/spanId/taskId 日志格式；`EtlMetrics`(etl.records.{in,out,dropped,deduped}/etl.load.duration/etl.insert.retry)；`docker-compose.yml` 开 `pg_stat_statements`+慢查询；新增 Grafana `etl_pipeline_hotpath.json`；`alerts.yml` 加 5 条流水线/JVM 告警。详见 `performance-analysis.md §6.5`。
-- **Phase 1 · Worker 骨架 + 状态机（3~6 周）**：新建 `etl-worker`（profile batch/stream）+ `SourceConnector`/`SinkWriter` SPI + Jdbc 实现；引入 `etl_task_run`/`etl_task_checkpoint` + `EtlTaskStatus`；task-mgmt 升级为 orchestrator，写 `dispatch.batch`+`progress`+`results`，旧 topic 保留按 `dataSourceId` 灰度；影子运行新旧链路比对。**回滚**：`etl.routing.newWorker=false` 全退旧链路，旧 topic 未动。
-  - 🔶 **状态机内核已落地（2026-10，分支 `etl-orchestrator`，全 10 模块 `mvn compile` + 内核 7 项单测 BUILD SUCCESS）**：`EtlTaskStatus`(12)/`EtlShardStatus`(6)/`ErrorClass` 枚举；DDL `db/schema/05-etl-task-run.sql`、`06-etl-task-checkpoint.sql`（含 INV 部分唯一索引 + CHECK）；`orchestrator/` 包内 `EtlTaskRun`/`EtlTaskCheckpoint` 实体与 Repository（`casStatus` 乐观并发、`aggregate` 收敛聚合、`refreshDerivedStatus` INV-6）；`AllowedTransitions`（迁移表，穷举单测锁定 **恰 32 条合法边**、112 条非法）+ `GuardChain`（G-2/G-3/G-4/G-5）+ `OrchestratorService.transition()`（非法抛异常、CAS 幂等、派生刷新、AFTER_COMMIT 事件）+ `DomainEventPublisher`(Phase 1 语义) + `OrchestratorEngine` 预留抽象 + `OrchestratorMetrics`。
-  - 🔶 **控制面接线已落地（2026-10，同分支，全 10 模块 `mvn test` + 23 项单测 BUILD SUCCESS）**：`OrchestratorProperties`/`DispatchProperties`（§7.8 退避/超时/背压集中配置，已写入 `config-repo/task-management-service.yml`）；四个 sweeper（`DispatchTimeoutSweeper` T8/T9、`BackoffReleaseSweeper` T21/T32、`AcceptanceSweeper` T30、`StallAndCancelSweeper` T13/T16，均 Redisson 单实例锁 + 只经 `transition()`）；`TokenBucket`（全局并发分片上限）；`BackoffSchedule`/`SweeperPolicy` 纯策略（可注入 now、已单测）；`LegacyStatusAdapter`（旧→新迁移纯翻译，§11.2）；已封堵 `PUT /api/tasks/{id}` 的 status/计数入参（§9）。
-  - 🔶 **Worker/SPI 骨架已落地（2026-10，同分支，全 12 模块 `mvn test` BUILD SUCCESS，新增 11 项单测）**：新增 Maven 模块 `etl-connector-spi`（纯 jar）+ `etl-worker`（boot jar，已入父 `<modules>`）。SPI：`ConnectorType`/`SourceConnector`/`SinkWriter`/`ConnectorRegistry` + 模型（`SourceSpec`/`Shard`/`ShardPlan`/`SourceRecord`/`SinkResult`）+ JDBC 参考实现（`JdbcSourceConnector` 主键区间流式游标、`JdbcSinkWriter` 批写+逐行降级、`ShardRanges` 纯分片）。worker：`ShardExecutor`（进程内 E→T→L：Reader→Transformer→Writer + 每 chunk 直写 checkpoint）、`CheckpointWriter`（`ON CONFLICT`+`GREATEST` 单调，INV-3）、`NumberScaleTransformer`、`DispatchBatchListener`（`etl.task.dispatch.batch`，Poison Guard）、`KafkaWorkerEventReporter`（progress/results）、`ConnectorConfig`（用 worker 自身 DataSource 组装注册表）；契约文档 `connector-spi.md`。
-  - 🔶 **模拟转换器 + 规则链已落地（2026-10，同分支，全 12 模块 `mvn test` BUILD SUCCESS，worker 新增 7 项单测）**：`worker/pipeline/transform/` 下按接入数据形态提供纯函数、可单测的模拟转换器——`StringTrimTransformer`（脏文本修剪）、`DateNormalizeTransformer`（多日期格式/epoch 秒毫秒 → ISO-8601）、`TypeCoercionTransformer`（CSV/NoSQL 全字符串 → Long/BigDecimal/Boolean，须排在日期归一之后）、`GeoJsonToWktTransformer`（GeoJSON Point/Line/Polygon/Multi* → PostGIS WKT，Jackson 解析、非几何原样保留）、`FieldPruneTransformer`（列白名单大小写不敏感裁剪 + snake_case 归一，保序不丢行、不影响对账等式）；`CompositeTransformer` 顺序编排、任一环返 null 即丢行计 dropped。`DataProfile`(JDBC/CSV/JSON/MONGO/GEOJSON) + `TransformerFactory.forProfile()` 按档位组链，`ConnectorConfig.recordTransformer(WorkerProperties)` 依 `etl.worker.transform-profile`/`number-scale`/`keep-columns` 挑选默认 bean（Phase 2 起改由任务级 DSL 驱动）。
-  - 🔶 **数据面接线已落地（2026-10，同分支，全 12 模块 `mvn test` BUILD SUCCESS，task-mgmt 新增 26 项单测、共 49）**：§13 #7/#8 + §11 影子切换。`orchestrator/dispatch/`：`DispatchService.pump()`（`@Scheduled(5s)` + Redisson 单实例锁，QUEUED→逐 PENDING 分片造 `etl.task.dispatch.batch` 消息、`PENDING→ASSIGNED`、首片 T5 `QUEUED→DISPATCHED`、令牌不足 T6 标 `THROTTLED`；`@Lazy` 自注入使 `dispatchOne` 事务生效）+ `ShardDispatchAssembler`（经 `DataSourceServiceClient` 解析源连接、connector 类型映射）+ `ShardDispatchCommand`（JSON 对齐 worker `ShardDispatch`，编排器不依赖 etl-worker）+ `DispatchPublisher`/`KafkaDispatchPublisher`（Phase 1 直投，Phase 2 切 outbox）+ `ShardRangeResolver` 接口（区间由 validate 持久化、pump 读取）。`orchestrator/kafka/`：`ProgressListener`（T7 首心跳 + 单调 touch + INV-5 违例计数）、`ResultsListener`（results 仅触发器，`ConvergencePolicy` 聚合重算 → T10/T11/T13/T14/T15）、`DltListener`（FATAL 行毒→T13 NEEDS_ATTENTION；ILLEGAL_TRANSITION/PROTOCOL_VIOLATION 仅告警不动状态，§7.6），三者 Poison Guard + 受 `etl.routing.newWorker` 门控。`ConvergencePolicy` 纯函数收敛判定。`TokenBucket.releaseWithinCapacity`（防 at-least-once 重复 results 超发）。影子切换：`RoutingProperties(etl.routing.new-worker/shadow-compare)` 默认 `false`=新链路休眠、旧链路零改动；`TaskCompletedListener`/`TaskFailedListener` 开新链时经 `LegacyStatusAdapter`→`transition` 收敛（D-25），不再直写 status。新 topic + routing 已入 `config-repo/task-management-service.yml`。
-  - 🔶 **入口链（submit→validate→分片计划）已打通（2026-10，同分支，全 12 模块 `mvn test` BUILD SUCCESS，task-mgmt 新增 9 项单测、共 58）**：补齐 §7.1 “submit 建 run + 校验”，新链路现可端到端运行（`newWorker=true` 时）。`orchestrator/validate/`：`RunValidator`（V-1 数据源可达、V-2 源表可读+connector 已注册、V-3 目标表名、V-4 分片数∈[1,shard-max-total] → T2 副作用后连续 `CREATED→VALIDATED→QUEUED`；任一失败 T3 `CREATED→FAILED(FATAL_CONFIG)`；非整体事务，计划落库经 `RunPlanWriter` 独立事务、各 transition 各自事务）+ `ShardPlanner`（task-mgmt 新增 `etl-connector-spi` 依赖，经 `ConnectorRegistry`→`JdbcSourceConnector.planShards` 出分片计划）+ `RunPlanWriter`（同事务 `setShardTotal` + 批量 INSERT PENDING checkpoint）。新 Bean：`OrchestratorConnectorConfig`（编排侧只注 JDBC 源）、`findCreatedStuck`/`setShardTotal` finder。§7.2 区间持久化缺口已关：DDL 06 + 实体加 `pk_from`/`pk_to`（§4.2/§7.2 文档同步），`CheckpointShardRangeResolver`（取代原 `NullShardRangeResolver`）直读该两列回填派工消息。`EtlTaskService.createTask` 接 `newWorker` 门控的 `createRun`+`validateAndQueue`（异常被吞不回滚 HTTP 提交）；`AcceptanceSweeper` 补 T31 重放（CREATED 驻留→重跑校验链，不耗 attempt）。
-  - ✅ **§12.1 集成测试已落地并跑绿（2026-10，同分支）**：`task-management-service/src/test/java/.../it/` 6 个 IT 类共 39 个用例，跑真 PostgreSQL（自建 `etl_it` 库，幂等套用 `db/schema/02|05/06`）+ 真 Kafka + 真 Redis（Redisson 锁），起完整应用上下文；Feign 是唯一替身。覆盖：144 组合穷举、终态保护、CAS 10 线程并发、INV-1/INV-6/INV-7 真索引、G-4 对账、dedup 跳 attempt、quiesce、心跳丢失补登记、T8/T9/T16/T21/T22/T30/T31/T32、退避精确到毫秒、三个监听器的真 broker 往返与毒消息位点前移、入口链 V-1..V-4 与派工契约（只带区间不带数据）、以及把真 `etl-worker` 上下文起在同一 JVM 的全链路 E2E（搬成 20 行真数据 + §12.2 四条一致性 SQL 返空）。开关：JUnit tag `it` 门控，`mvn test` 不跑（无基础设施也不会红），`mvn -pl task-management-service -am test -Pit` 全跑（单元 62 + 集成 39 = 101 全绿）。详见 `orchestrator-design.md §12.1.1`。
-  - 🔧 **集成测试拓出并修好 3 个真缺陷**（单元测均绿、只有真库/真 broker 能暴露）：① `ux_run_task_attempt(task_id, attempt_no)` 全局唯一与 T1「新建 run 归 1」矛盾，第二次 submit 必撞唯一键 → 改为仅约束 `is_current` 的部分索引（DDL 05 + §4.2/INV-7 已同步）；② `ProgressListener` 心跳写库无事务（`@Modifying` 抛 `TransactionRequiredException` 并导致 Kafka 反复重投）→ `touchProgress`/`touch` 自带 `@Transactional`；③ `JdbcSourceConnector.ResultSetCursor.next()` 误将 `nextCached` 置 `false`（应为 `null`）→ 每分片只读 1 行、目标表缺数却能收敛 `SUCCEEDED`。
-  - ⏳ **Phase 1 待办**：旧链路 cutover 下线（`EtlTaskService/TaskScheduler` 字面量 `setStatus`，`newWorker=false` 时零影响）、§9 人工 API（`/cancel` `/retry` `/resume` `/abort` `/failures`，其中 `/cancel` 不落地则 §12.1「取消不可达」只能等价模拟、`/retry` 不落地则「DLT 死循环」无法 IT）、Phase 2 outbox + `07-etl-task-dlt.sql` DLT 落表。（入口链、§12.1 集成用例、**`etl_task_run` 计数投影**（`RunCounterProjector`：results 逐条投影含未收敛中间态 + 收敛类迁移落终态快照，使 §12.2 校验 2 不再是空转断言）**已完成**。）
-- **Phase 2 · 多源 SPI + 失败处置完备（7~9 周）**：`MongoConnector`/`FileConnector`(JSON/CSV/GeoJSON)；`generateCreateTableSql` 强制 PK + `idempotency_key UNIQUE`；DLT + ErrorClassifier + Outbox；`/retry?shards=failed`、`/cancel`；非 JDBC 全走新链路，JDBC 25%→50%→100% 切流。
-- **Phase 3 · 流式通道（10~12 周）**：上线 stream-runtime；接 IoT（`source.iot.raw.*`）、文件监听（MinIO webhook→`source.file.arrival`）；微批 sink + offset checkpoint；UI 加 stream 列表与 lag 面板。
-- **Phase 4 · 旧链路下线（13~14 周）**：连续 7 天旧 topic 无生产且 lag=0 → 删除三服务、从父 `pom.xml <modules>` 移除、删旧 topic、同步 `docs/` 与 `README.md`。
+1. **数据面优先**：先证明“不丢、不重、可续、可对账”，再扩状态机/灰度。
+2. **checkpoint 是真源**：`results/progress` 只是触发器；终局由 checkpoint 聚合重算。
+3. **单一写路径**：`etl_task_run.status` 只经 `transition()`；checkpoint 由 worker 写、orchestrator 只读聚合。
+4. **DB 约束优先**：单当前 run、shard 唯一、attempt 唯一、行级对账 CHECK 尽量下沉到 DB。
+5. **at-least-once + 幂等**：不宣称 exactly-once；所有数据面写入必须可重放。
+6. **安全默认**：凭据不落消息、不落日志；DB 加密；密钥可轮换。
+7. **低基数可观测**：taskId 只进日志/DB，不进指标标签。
+8. **先小后大**：先用 1 个 dataSource 灰度，再 25/50/100。
 
-### 7.2 风险登记
+### 2.2 目标组件
+
+| 组件 | 目标职责 | 现状 |
+|---|---|---|
+| gateway | JWT/RBAC、路由 `/api/tasks/**`、`/api/data-sources/**` | 路由前缀需修正 |
+| orchestrator（task-management） | submit/validate/dispatch/converge/cancel/retry/failures；只编排不处理数据 | 状态机已实现；API/补派/许可待补 |
+| data-source-service | 数据源元数据 CRUD；凭据加密/短期令牌 | 仍明文 |
+| etl-worker（batch profile） | 进程内 Source→Transform→Sink；chunk 提交；checkpoint；progress/results/DLT | 骨架；原子性/续跑/重试待补 |
+| etl-connector-spi | Source/Sink 接口；JDBC 参考实现；目标类型与源类型解耦 | 需拆 source/sink 选择 |
+| PostgreSQL | `etl_task`/run/checkpoint/dlt/audit/outbox；目标库 | 05/06 已有；07/08/09 待建 |
+| Kafka | 控制面 dispatch/progress/results/dlt/commands | 已有 topic 配置；DLT 生产端待补 |
+| Redis | 分布式锁/热点缓存/旧链路展示缓存 | 旧链 Redis 无 TTL 待修 |
+| monitoring | 指标/Gauge/告警/面板/runbook | 需补 orchestrator 组 |
+
+### 2.3 批处理数据流（target）
+
+```text
+POST /api/tasks
+  → 建 etl_task + etl_task_run(CREATED)
+  → 异步 validate（V-1..V-4）
+  → 生成 shard 计划（分片数=并行度，chunk=事务单元）
+  → QUEUED
+  → DispatchService 按 DB 许可持续补派 PENDING
+  → worker 领取 shard：SourceReader → Transformer → SinkWriter
+      每个 chunk：目标写入 + checkpoint(last_cursor) 同事务
+      每个 shard 结束：results
+  → orchestrator 聚合 checkpoint → SUCCEEDED/PARTIAL/FAILED/NEEDS_ATTENTION
+  → failures/DLT/audit 可查
+```
+
+### 2.4 控制面状态模型
+
+- 保留 12 态/32 边；**Phase 1 不新增状态、不新增边**。
+- 新增“收敛检查”作为 sweeper 的一段逻辑，不新增 `CONVERGING` 状态。
+- lease/fencing 用 checkpoint 列表达（`lease_owner`、`lease_until`、`shard_attempt`），不新增 shard 状态。
+- `cancel_requested_at` 继续表达软取消；不新增 `CANCEL_REQUESTED` 状态。
+
+### 2.5 Phase 1 明确不做
+
+- Mongo/File/GeoJSON/IoT/stream runtime。
+- 独立 Flink/Iceberg/湖仓。
+- 多租户、跨集群 DAG、复杂权限模型。
+- 完整 outbox/audit 的全部运维能力（Phase 1B 只做最小闭环）。
+- 生产 HA 集群（先明确单节点风险与备份/恢复）。
+
+---
+
+## 3. 关键决策（Decision Log）
+
+| ID | 结论 | 理由 | 被否方案 |
+|---|---|---|---|
+| D1 | 保留 12 态/32 边，Phase 1 不再扩状态机 | 已实现且有测试；当前瓶颈在数据面 | 推翻重做/新增状态 |
+| D2 | 目标表 Phase 1 就加 PK + `idempotency_key UNIQUE` + `ON CONFLICT` | 没有 PK 的重试必然重复；Phase 2 太晚 | 先跑通再补 PK |
+| D3 | 明确提交边界：同库用本地事务；跨库用幂等写入 + checkpoint after commit + 重放安全；每 chunk 写 `last_cursor`；worker 从 `resumeCursor` 续跑 | 跨库不应引入 XA/2PC；“断点续传”必须可读可写 | 只写 checkpoint 不读、跨库 2PC |
+| D4 | 分片数=并行单元（8~32/任务），chunk=事务单元（5k~20k） | 避免 6000 分片/任务的控制面爆炸 | 一 chunk 一 shard |
+| D5 | 全局许可用 DB `COUNT(ASSIGNED/RUNNING)` 或 Redisson 信号量 | JVM Semaphore 不全局、不抗重启 | 继续用本地 Semaphore |
+| D6 | 派工 key=`runId+shardId`；worker 配 `concurrency`/`max-poll-records`/异步执行 | 修复 I1；避免 rebalance 重投 | taskId 作 key、单线程 |
+| D7 | 派工/结果发送至少等待 ack；Phase 1B 切最小 outbox | 异步 send 丢消息无法感知 | 只记 ERROR 日志 |
+| D8 | 引入 `ErrorClassifier` + 分片内重试 + T12/T21 + DLT 落表 | 失败处置是 Phase 1 核心 | 异常直接 FAILED |
+| D9 | `rows_filtered` 与 `rows_failed` 分离；`SUCCEEDED` 不允许 failed>0 | 防止静默丢数被判成功 | 继续用 `rowsDropped` 混用 |
+| D10 | 凭据只传 `dataSourceId`；DB 加密；JWT secret 外置 | 安全是出厂门槛，不是 Phase 2 | 派工消息带明文 password |
+| D11 | 取消/重试/恢复/失败查询 API 最小闭环进 Phase 1B | NEEDS_ATTENTION 必须可操作 | 全部推到 Phase 2 |
+| D12 | 灰度按 dataSource + shadow compare；回滚需排空在途 run | 全局布尔开关不可灰度 | `newWorker` 全开全关 |
+| D13 | 2 周 spike 评估 Spring Batch/Temporal；未通过则切换 | 自研可靠性轮子风险高；补充件已推荐 | 先写完再评估 |
+| D14 | 源端一致性用高水位线 + 明确语义（快照/尽力而为） | 无快照的跨分片扫描无法保证不漏不重 | 默认强一致 |
+| D15 | sink 按 `targetDataSourceId` 选择，不复用 worker 本地 DataSource；MySQL 源→PG 目标必须回归 | 现有 `ConnectorConfig` 按源类型注册 sink，可能写错库 | 沿用源类型选 sink |
+
+---
+
+## 4. 阶段路线图
+
+> 时间按“10 人、3 个并行 stream、无独立 SRE”估算；关键路径（崩溃续跑、幂等、30M 压测、灰度观察）不因加人而压缩。每个阶段必须有可验证的退出条件，不以“代码写完”作为完成。
+
+| 阶段 | 时间盒（10 人） | 关键路径 / 不可压缩项 |
+|---|---|---|
+| Phase 0 | 1 周 | 基线、端口、路由 |
+| Phase 1A | 3 周 | 崩溃续跑 + 幂等 + 30M 压测；10 人并行但关键路径不变 |
+| Phase 1B | 2~3 周 | 多实例、收敛、API、回滚；可与 Phase 1A 后半段并行设计 |
+| Phase 1C | 4 周 | 1 个 dataSource 7 天 + 25/50/100 各 1 周；观察期不可压缩 |
+| Phase 2 | 4~6 周 | 多源 connector/治理；可并行 2 个 connector stream |
+| Phase 3 | 4~6 周（条件） | stream runtime；业务未确认则跳过 |
+| Phase 4 | 1~2 周 | 旧链路 drain/删除；依赖 100% 运行 ≥2 周 |
+
+> 10 人不是把 Phase 1 砍到 5 周：开发部分约 6 周，灰度观察 4 周，合计约 10 周；多出的人力用于并行测试、安全、可观测性和 Phase 2 预研。
+
+### Phase 0 · 收尾与基线（1 周）
+
+**目标**：把 v1 Phase 0 的欠账补齐，给后续改动一个可比较的基线。
+
+**交付物**
+
+- 旧 Redis `task:status:{taskId}` 加 TTL（建议 24h）。
+- 复制一份修复后的基线：P50/P95/P99 任务时长、行/秒、Full GC、源库 CPU/连接、Kafka lag。
+- worker 端口改为独立端口（避免与 user-service 8086 冲突），加入 `config-repo/etl-worker.yml` 与 Prometheus target。
+- 修正 gateway 路由前缀（`/api/tasks/**`、`/api/data-sources/**`）。
+- 关闭 v1 文档中与实现不符的“已完成”标记，链接评审报告。
+
+**退出条件**
+
+- 基线数据落 `docs/architecture/performance-baseline-2026-10.md`（或等价文档）。
+- 本地启动栈无端口冲突；worker 指标可被抓取。
+
+**执行状态（2026-10-19）**
+
+- [x] 旧链路 Redis `task:status:*` 增加 24h TTL（可配 `etl.legacy.redis-status-ttl-hours`）。
+- [x] worker 端口改为 8087；新增 `config-repo/etl-worker.yml`；Prometheus 增加 8087 target。
+- [x] gateway 路由改为 `/api/tasks/**`、`/api/data-sources/**`，并修正 health 路由顺序。
+- [x] 建立 `docs/architecture/performance-baseline-2026-10.md` 采集模板与 SQL/PowerShell 命令。
+- [x] `mvn test -DskipITs` 全 reactor 通过（12 模块，BUILD SUCCESS）。
+- [x] 基线数值已采集（legacy 链路，`newWorker=false`）：4 次 warm 样本 P50 45.57s、P95 49.73s、吞吐 427.9 行/s，冷启动 95.84s；Redis TTL≈24h；任务结束后 Kafka lag=0。详见基线文档 §7。
+- [x] gateway 运行时回归：`/api/tasks`、`/api/data-sources`、`/api/data-sources/actuator/health` 均 200，无 token 请求 401。
+
+### Phase 1A · 数据面正确性 Gate（3 周，最高优先级；10 人并行不压缩关键路径）
+
+**目标**：证明“30M 行、>100 分片、崩溃/重试/重复投递下不丢不重、可续跑、可对账”。
+
+**工作包**
+
+1. **WP-01 全量派工**：`DispatchService` 对 `DISPATCHED/RUNNING` 且仍有 PENDING 的 run 持续补派；`QUEUED→DISPATCHED` 仅一次；令牌不足时部分获取而非全有或全无。
+2. **WP-02 提交边界 + 续跑**：同库时 sink 与 checkpoint 共享本地事务；跨库时目标幂等提交后再写 checkpoint，崩溃重放安全；每 chunk 写 `last_pk/last_cursor`；`JdbcSourceConnector.open` 从 `resumeCursor` 之后读；边界去重。
+3. **WP-03 幂等与目标连接**：目标表建 PK + `idempotency_key UNIQUE`；`INSERT ... ON CONFLICT DO UPDATE/NOTHING`；明确 `targetDataSourceId`，sink 不复用 worker 本地 DataSource；Source/Sink 解耦并回归 MySQL→PG；`rows_deduped` 语义明确。
+4. **WP-04 丢数可见**：`JdbcSinkWriter.writeRowByRow` 显式 commit；拆 `rows_filtered`/`rows_failed`；坏行写 `etl_task_dlt`（新增 `07-etl-task-dlt.sql`）；failed>0 不得 `SUCCEEDED`。
+5. **WP-05 失败处置**：`ErrorClassifier`（TRANSIENT/PERSISTENT/FATAL）+ 分片内重试 + T12/T21 + DLT 生产端；worker 不再把所有异常标 PERSISTENT。
+6. **WP-06 安全**：派工只带 source/target `dataSourceId`；worker 通过 data-source-service 获取短期凭据；DB 口令加密；JWT secret 外置；Kafka payload 扫描无明文口令。
+7. **WP-07 数值/空间**：取消默认 2 位小数；按列精度；`PGobject`/`ST_GeomFromText(?,4326)`；支持 MultiPolygon/GeometryCollection；MySQL→PG 类型映射。
+8. **WP-08 并行消费**：派工 key 改 `runId+shardId`；worker 配置 concurrency/max-poll；长分片异步执行 + pause/resume。
+9. **WP-09 测试**：>100 分片、崩溃续跑、重复投递、坏行 DLT、PostGIS、MySQL 类型、MySQL→PG sink、1 任务 8 分片 2 worker。
+
+**退出条件（Gate 1）**
+
+- 评审报告 §9.1 的 1～9 项全部通过。
+- 30M 行、>100 分片、20 并发任务压测通过（或给出可解释的容量上限）。
+- 崩溃后目标行数 = 源行数，无重复；重复投递不产生重复数据。
+- 安全扫描：Kafka payload/日志/DB 无明文凭据。
+- **未通过则不得开启 `newWorker=true`。**
+
+### Phase 1B · 控制面收口与可运维（2~3 周）
+
+> 可在 Phase 1A 后半段并行设计 API/告警/灰度契约，但 Gate 2 必须在 Gate 1 之后。
+
+**目标**：让新链路可操作、可观测、可回滚；不新增状态。
+
+**工作包**
+
+1. **WP-10 收敛与守卫**：`ConvergenceSweeper`（无活跃分片时重算）；T31 幂等；G-2 总和校验；T19 failed=0/无未解决 DLT；G-7 DLT_CLEAN。
+2. **WP-11 lease/fencing**：checkpoint 加 `lease_owner/lease_until`；写入带 `shard_attempt/lease` 条件；`/resume` 重置过期 lease 并写 audit。
+3. **WP-12 全局许可**：用 DB `COUNT(ASSIGNED/RUNNING)` 或 Redisson 信号量；去掉 JVM `Semaphore` 的全局假设。
+4. **WP-13 目标表治理**：V-3 真正验证/创建目标表（advisory lock）；worker 不再每分片建表；类型映射/列名引用；存量目标表的 PK/唯一索引迁移与重复数据清洗。
+5. **WP-14 API 最小闭环**：`GET /progress`、`POST /cancel`、`GET /failures`；`/retry`、`/resume`、`/abort` 至少留出契约与 409 语义。
+6. **WP-15 观测**：`etl.run.state.count`、`etl.checkpoint.lag.seconds`、`etl.dlt.unresolved.size`、`etl.sweeper.actions.total`；`etl-orchestrator-alerts` 告警组；MDC runId/shardId/attemptNo。
+7. **WP-16 迁移能力**：dataSource 白名单灰度；shadow compare（行数/校验和/终态/耗时）；回滚 runbook（停提交→排空/取消→切旧链路）。
+8. **WP-17 源端一致性**：高水位线/快照语义；MySQL 流式 fetch；查询超时/取消。
+9. **WP-18 契约与文档**：dispatch/results JSON 契约测试；修正 `orchestrator-design.md` 的 dispatch key/lease/DLT/DB 许可；更新 `connector-spi.md`。
+
+**退出条件（Gate 2）**
+
+- 2 个 orchestrator + 2 个 worker 多实例测试通过；令牌桶/lease 全局有效。
+- 结果丢失、ASSIGNED-only、T31 重放、旧 worker 迟到写入均有测试。
+- 告警可触发；`/progress`/`/cancel`/`/failures` 可用；网关路由可达。
+- 回滚演练通过：无孤儿 run、无重复写入。
+
+### Phase 1C · 灰度（4 周：1 个 dataSource 观察 7 天 + 3 个放量阶段各 1 周）
+
+**目标**：在真实业务上验证新旧链路一致性和回滚能力。
+
+**步骤**
+
+1. 选 1 个 `dataSourceId`，`newWorker=true` + 白名单；其余 dataSource 仍走旧链路。
+2. 影子比对：目标表行数、分片 checksum、终态、耗时；每日报表。
+3. 通过后 25% → 50% → 100%；每阶段观察 1 周。
+4. 任一 P0 指标异常：停止新提交 → 排空/取消在途 run → `newWorker=false` → 旧链路接管。
+
+**退出条件（Gate 3）**
+
+- 连续 7 天无数据差异、无 P0 告警、无孤儿 run。
+- 回滚演练在真实 dataSource 上通过。
+- 旧链路至少保留一个可回退版本。
+
+### Phase 2 · 多源与治理（4~6 周，Gate 3 之后）
+
+**范围**
+
+- Mongo/File(JSON/CSV/GeoJSON) connector；在 Phase 1A 已解耦的 Source/Sink 上扩展。
+- 目标表治理：命名/保留/清理/血缘；一任务一表的策略复核。
+- Schema Registry/契约（可选，按团队能力）。
+- audit 表与人工操作审计；outbox 完整化（若 Phase 1B 只做了最小闭环）。
+- 数据质量：行数/checksum/抽样比对；nightly 校验落定时任务。
+- MySQL/PostGIS 真实样本回归。
+
+**明确不做**：独立 Flink/湖仓/多集群。
+
+### Phase 3 · 流式通道（条件触发，4~6 周）
+
+**触发条件**：IoT/CDC/文件监听有明确业务需求，且 Phase 2 的批处理稳定运行 ≥1 个月。
+
+**范围**
+
+- `etl-worker` stream profile；`source.iot.raw.*`/`source.file.arrival`。
+- 常驻 run 的状态语义（不适用 G-2/G-4）；静默源与卡死的区分。
+- Kafka lag/offset checkpoint；pause/resume。
+
+**若业务未确认，Phase 3 直接跳过，不为了“架构完整”而做。**
+
+### Phase 4 · 旧链路下线（1~2 周）
+
+**前置条件**
+
+- 新链路 100% dataSource 运行 ≥2 周。
+- 旧 topic 连续 7 天无生产、lag=0。
+- 旧服务无在途任务；旧目标表已归档/确认。
+
+**动作**
+
+- 停止旧 `TaskScheduler`/旧监听器；删除旧 topic；从父 pom 移除 E/T/L 三服务。
+- 保留 3 个月发布产物与配置；打 `git tag pre-etl-merge-v1`。
+- 更新 `architecture-overview.md`、`README.md`、`AGENTS.md`、运行手册。
+
+---
+
+## 5. 工作分解与角色（10 人假设）
+
+| 角色 | 人数 | 主要职责 | 对应工作包 |
+|---|---|---|---|
+| A · 编排/控制面 | 2 | 状态机、sweeper、dispatch、API、灰度/回滚 | WP-01、WP-10、WP-11、WP-14、WP-16 |
+| B · 数据面/连接器 | 3 | worker、checkpoint、sink/source、幂等、DLT | WP-02、WP-03、WP-04、WP-05、WP-08、WP-13 |
+| C · 平台/安全/观测 | 2 | PG/Kafka/Redis、密钥、指标、告警、压测 | WP-06、WP-12、WP-15、WP-17 |
+| D · 测试/质量 | 2 | IT/故障注入/契约测试/验收脚本 | WP-09、Gate 1/2/3 |
+| E · 产品/运维 | 1 | 业务口径、失败处置流程、回滚决策、on-call | WP-16、Gate 3、Phase 4 |
+| **合计** | **10** | | |
+
+**并行 stream（10 人）**
+
+| Stream | 人员 | 负责工作包 | 依赖 |
+|---|---|---|---|
+| S1 数据面正确性（关键路径） | B×2 + C×1 + D×1 | WP-01～05、08、09 | 无 |
+| S2 安全/目标连接/性能 | B×1 + C×1 + D×1 | WP-06、07、17 + 30M 压测 | S1 的 sink/checkpoint 接口 |
+| S3 控制面/API/灰度 | A×2 + E×1 | WP-10～16、18 | S1 的 checkpoint 语义；Gate 1 后全面展开 |
+
+> Gate 1 后，S1/S2 的主力并入 S3，优先 WP-11～15、18；S3 保留 1 人继续灰度准备。
+>
+> 10 人协作：每 2 周一个集成点；S1 对 Gate 1 负责，S3 对 Gate 2 负责；数据/状态路径改动需 2 人 review；30M 压测只做一次统一环境，避免各 stream 重复占资源。
+>
+> 如果实际可用人力 <6：回退到 5 人基线（Phase 1A/1B 各 +1 周）；<4：只做 WP-01～WP-06，Phase 2/3 延后。
+
+---
+
+## 6. 验收门槛与度量
+
+### Gate 1 · 数据面正确性（Phase 1A 结束）
+
+- 评审报告 §9.1 的 1～9 项全部通过。
+- 30M 行/20 并发/4C8G 压测：无 OOM、无 Full GC 风暴、无任务卡死；P95 相对基线有明确改善或给出容量上限。
+- 压测在源表静态或快照隔离下进行；源表并发写语义在 Gate 2 前关闭（评审 §9.1-13）。
+- 崩溃/重试/重复投递：目标行数 = 源行数；无重复；G-4 与 checksum 一致。
+- 失败处置：瞬态重试成功、持久退避、FATAL 进 DLT；`rows_failed>0` 不判 SUCCEEDED。
+- 安全：Kafka/日志/DB 无明文凭据。
+
+### Gate 2 · 可运维/多实例（Phase 1B 结束）
+
+- 评审报告 §9.1 的 10～14 项全部通过。
+- 2 orchestrator + 2 worker；无令牌桶饥饿/超发；无 rebalance 双跑。
+- 结果丢失、ASSIGNED-only、T31 重放、旧 worker 迟到写入测试通过。
+- `/progress`/`/cancel`/`/failures` 可用；网关路由可达；告警触发。
+- 回滚演练通过。
+
+### Gate 3 · 灰度（Phase 1C 结束）
+
+- 1 个 dataSource 连续 7 天：行数/校验和/终态/耗时无差异。
+- 25/50/100 每阶段观察 1 周；无 P0 告警。
+- 回滚真实演练通过；旧链路可回退。
+
+### Gate 4 · 旧链路下线（Phase 4）
+
+- 新链路 100% ≥2 周；旧 topic 7 天无生产、lag=0；无在途任务。
+- 旧服务删除后，监控/告警/runbook 全部指向新链路。
+
+### 关键指标
+
+- `etl.run.state.count{status}`、`etl.checkpoint.lag.seconds`、`etl.dlt.unresolved.size`。
+- 任务 P50/P95/P99、行/秒、失败率、重试率、DLT 率、`rows_failed` 率。
+- 源库 CPU/连接数/慢查询；Kafka lag；worker GC。
+- 新旧影子比对：行数差、checksum 差、终态差、耗时差。
+
+---
+
+## 7. 风险与不推进条件
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| worker 单进程 E-T-L 爆炸半径大 | 一错规则中断整批 | Bulkhead `activeShards` 上限；shard 级重试；DLT 隔离毒 shard |
-| 20~30M 行 + PostGIS → OOM | worker 频繁 GC | fetchSize 流式 + chunk≤5k + 堆 2G + `G1MaxNewSizePercent=50`；大 GeoJSON spool 临时目录 |
-| 新旧 topic 并存消息分裂 | UI/回滚不一致 | 双消费组写同一 `etl_task_run`；orchestrator 幂等 `(taskId,runId)` |
-| 状态机触及全部读写路径 | 遗漏致状态漂移 | 移除全部 `setStatus("literal")`，grep 校验只允许 `transition(...)` |
-| 无 PK 历史目标表 | 加 PK 唯一性冲突 | Phase 2 迁移脚本：加 `idempotency_key` 回填去重后 `ALTER ADD PRIMARY KEY` |
-| Redis 完成判定退位 | 旧展示层断链 | UI 改查 checkpoint；Redis Hash 保留 24h 加速缓存 |
-| 团队学习状态机/outbox | 交付延期 | 手写状态表 + `@TransactionalEventListener`，不引 Spring StateMachine；配 `orchestrator-design.md`+runbook |
-| Phase 4 删服务后回滚窗口关闭 | 严重问题需重部署 | 保留 3 个月发布产物与 config；`git tag pre-etl-merge-v1` |
+| 自研可靠性轮子成本超预期 | Phase 1A 延期、线上故障 | 2 周 spike；不通过则 Spring Batch/Temporal |
+| 30M 行/20 并发超容量 | 任务卡死/OOM/源库过载 | 压测、分片/ chunk 调参、源库限流 |
+| 源表并发写 | 漏行/重复/对账不平 | 高水位线/快照语义；明确假设 |
+| PostGIS/GeoJSON 类型复杂 | 主场景失败 | 真实样本、GeoTools/PGobject、SRID 契约 |
+| 凭据治理阻塞 | 无法上线 | Phase 1A 就做；Vault/KMS/Jasypt 备选 |
+| 灰度回滚不干净 | 数据双写/孤儿 run | dataSource 白名单、排空/取消 runbook、演练 |
+| 团队容量不足 | 质量下降 | 缩小 Phase 1 范围；Phase 2/3 延后 |
 
-### 7.3 度量与验收
+**不推进（No-Go）条件**
 
-- A：Phase 1 后端到端跳数 7→3；P95 duration 相对基线降 ≥40%。
-- B：任一 NEEDS_ATTENTION 任务 30s 内拿到 stack + shard 列表 + DLT 原文。
-- C：`etl_task.status` 与 checkpoint 汇总一致性 100%（nightly 校验）。
-- D：Phase 2 后从 checkpoint 恢复重跑成功率 ≥95%；单 shard 重试不影响其他。
-- E：Phase 3 后支持 4 类源 + 流批双模式，`data_source.type` 至少含 `mysql|postgres|mongo|file_json|file_csv|file_geojson|kafka_iot`。
-
----
-
-## 8. 落地需产出的仓库文件（Phase 0/1 首批）
-
-- 目标态图：`target-container-view.dot`、`target-lifecycle-states.dot`、`target-dataflow.dot`（本目录，已随本方案创建）。
-- 设计文档：`orchestrator-design.md`（状态机 + outbox + SPI 契约）—— ✅ **已产出**（含 §3/§4 规则与判定的补齐清单与 25 条决策记录）；`connector-spi.md`（Source/Sink 接口签名）、`migration-runbook.md`（每阶段开关、验证 SQL、回滚指令）——随 Phase 0/1 实施编写。
-- DDL：`db/schema/05-etl-task-run.sql`、`06-etl-task-checkpoint.sql`、`07-etl-task-dlt.sql`、`08-etl-task-audit.sql`。
-- 代码：新增 `etl-connector-spi/`、`etl-worker/`；`task-management-service` 内 `orchestrator/` 包与 `EtlTaskStatus` 枚举。
-- 监控：`etl_pipeline_hotpath.json`、`postgres_health.json`；`alerts.yml` 扩充 §6.3 六条。
+- Phase 1A 结束时，崩溃续跑/重复投递/全量派工仍不能稳定通过。
+- 30M 行/20 并发压测出现不可接受的 OOM/卡死/源库过载。
+- 安全项无法在 Phase 1A 关闭。
+- 灰度出现无法解释的数据差异或重复写入。
+- 团队无法承担 12 态 + 4 sweeper + outbox 的长期维护（则切换框架）。
 
 ---
 
-## 9. 假设与待确认
+## 8. 文档与代码联动
 
-1. 数据规模：单任务 ≤ 30M 行、并发 ≤ 20、节点 4C8G 起；若并发 > 100/多租户需引入 per-task 派生模式，预留 `DispatchStrategy` 抽象。
-2. 团队 ≤ 5 人、无独立 SRE，可观测优先复用现 Prometheus/Grafana 栈。
-3. 保留 Kafka 作流式源与事件总线；**批处理数据面不再穿越 Kafka**，仅控制面（dispatch/progress/results/dlt）。
-4. 不引入编排框架；自研状态机 + checkpoint。后续出现跨任务 DAG/多集群调度再评估并接入 `OrchestratorEngine` 抽象（业界对照见 `risk-addendum-and-tech-selection.md`）。
-5. `user-service` 与 gateway JWT 保留；orchestrator 的 `/retry`、`/cancel` 走同一 RBAC。
+| 文档/代码 | 动作 | 时机 |
+|---|---|---|
+| `docs/architecture/etl-architecture-review-2026-10-19.md` | 评审基线，保持只读 | 已保存 |
+| `docs/architecture/etl-architecture-evolution-plan.md` | 本文件（v2） | 已更新 |
+| `docs/architecture/orchestrator-design.md` | 更新 dispatch key、lease 字段、DLT 表、DB 许可、Phase 1 范围；不新增状态 | Phase 1A/1B 实现时 |
+| `docs/architecture/target-lifecycle-states.dot` | 仅在状态/边变化时更新；v2 不变 | 如变更 |
+| `docs/architecture/connector-spi.md` | Source/Sink 解耦、resumeCursor、目标类型映射 | Phase 1A |
+| `db/schema/07-etl-task-dlt.sql` | DLT 表 | Phase 1A |
+| `db/schema/08-etl-task-audit.sql` | audit 表 | Phase 1B |
+| `db/schema/09-etl-outbox.sql` | 最小 outbox | Phase 1B |
+| `config-repo/task-management-service.yml` | dataSource 白名单、dispatch key、许可、DLT、指标 | Phase 1A/1B |
+| `config-repo/etl-worker.yml` | worker 端口、concurrency、max-poll、transform 配置 | Phase 0/1A |
+| `monitoring/prometheus/rules/alerts.yml` | orchestrator 告警组 | Phase 1B |
+| `monitoring/grafana/dashboards/etl_task_overview.json` | 任务/分片/DLT/延迟面板 | Phase 1B |
+| `AGENTS.md` | 新构建/测试/运行注意事项 | Phase 1A 完成后 |
+
+---
+
+## 9. 开放问题（需产品/运维确认）
+
+1. 源表在 ETL 期间是否允许并发写？采用快照还是高水位线？
+2. 峰值并发任务/分片数、每源库连接上限是多少？
+3. orchestrator/worker 是否多实例部署？单实例是否可接受？
+4. orchestrator 与 worker 是否始终共享同一 PostgreSQL？
+5. 目标表保留/清理/血缘策略是什么？
+6. 凭据治理用 Vault/KMS/Jasypt 哪一种？是否允许 worker 动态取凭据？
+7. `PARTIAL_SUCCESS`/数据丢失的业务容忍度与宽恕权限归谁？
+8. NEEDS_ATTENTION 的值班/升级/SLA 是什么？
+9. 是否允许引入 Spring Batch/Temporal？团队能否维护？
+10. 性能基线/目标 P95/吞吐/容量是多少？
+11. 回滚窗口与在途 run 的处理策略是什么？
+12. 源类型/PK 类型矩阵（无 PK、字符串 PK、复合 PK、分区表、视图）是什么？
+13. 目标 schema/type mapping 契约（SRID、precision、timezone、MySQL→PG）由谁定义？
+14. PG/Kafka/Redis 的 HA/备份/恢复要求与 RPO/RTO 是什么？
+15. 是否接受手工 JSON 契约，还是引入 Schema Registry？
+
+---
+
+## 10. 最初 10 个工作日
+
+| 天 | S1 数据面正确性（关键路径） | S2 安全/目标连接/性能 | S3 控制面/API/灰度 |
+|---|---|---|---|
+| 第 1 天 | 保持 `newWorker=false`；确认样本/角色 | 密钥/目标库/压测环境确认 | API/灰度/回滚范围确认 |
+| 第 2 天 | 采基线；列出 P0 对应代码 | 安全基线/凭据扫描 | 现有 API/网关/告警盘点 |
+| 第 3–5 天 | WP-01 全量派工 + WP-02 提交边界/续跑 | WP-06 凭据治理 + WP-07 数值/空间 | WP-10/11/14 设计；路由/白名单设计 |
+| 第 6–7 天 | WP-03 目标幂等 + WP-04 坏行 DLT | WP-17 源端一致性 + MySQL→PG 回归 | WP-12/13/15 设计；shadow compare 设计 |
+| 第 8 天 | WP-05 ErrorClassifier/重试 | 30M 压测数据/环境准备 | WP-16 回滚 runbook 初稿 |
+| 第 9 天 | WP-08 并行消费 + WP-09 测试 | 30M 压测执行 | Gate 1 证据清单/评审材料 |
+| 第 10 天 | Gate 1 预评审（S1 主导） | 压测/安全报告 | 决策：继续自研/切 Spring Batch/Temporal |
+
+> 第 10 天是 Gate 1 预评审，不是最终 Gate 1；最终 Gate 1 在 Phase 1A 第 3 周末。没有崩溃续跑/重复投递/全量派工证据，不进入 Phase 1B。
+
+---
+
+## 11. 变更记录
+
+- **2026-10-19 v2.0**：按 `etl-architecture-review-2026-10-19.md` 重制；Phase 1 改为“数据面正确性 Gate”；团队假设由 5 人更新为 10 人；补 `targetDataSourceId`、跨库提交边界、DLT/幂等提前；Phase 1C 明确为 4 周灰度。
+- **v1**：旧版演进计划，见 git 历史。

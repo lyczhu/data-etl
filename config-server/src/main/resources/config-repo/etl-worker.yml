@@ -1,0 +1,16 @@
+server:
+  # user-service 占用 8086；worker 使用独立端口，避免本地/容器端口冲突。
+  port: 8087
+
+spring:
+  kafka:
+    consumer:
+      # 一条 dispatch = 一个 shard；单次只取一条，避免长分片阻塞 poll。
+      max-poll-records: 1
+      properties:
+        # 长分片仍同步执行；Phase 1A 再切异步 + pause/resume，这里先放宽 rebalance 阈值。
+        max.poll.interval.ms: 1800000
+    listener:
+      # 3 个并发消费者对应 3 个 shard；同一 shard 的重复投递由 checkpoint/幂等兜底。
+      concurrency: 3
+      ack-mode: record

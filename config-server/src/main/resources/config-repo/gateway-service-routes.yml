@@ -2,32 +2,31 @@ spring:
   cloud:
     gateway:
       routes:
-        # 1. 数据源服务 API 路由
+        # 1. 数据源服务健康检查路由（必须先于 API 路由，否则 /api/data-sources/** 会抢先匹配）
+        - id: route-data-source-health
+          uri: lb://data-source-service
+          predicates:
+            - Path=/api/data-sources/actuator/**
+          filters:
+            - StripPrefix=2
+
+        # 2. 数据源服务 API 路由（StripPrefix=0：服务端控制器即为 /api/data-sources）
         - id: route-data-source-api
           uri: lb://data-source-service
           predicates:
-            - Path=/api/data-source/**
+            - Path=/api/data-sources/**
           filters:
-            - StripPrefix=1
+            - StripPrefix=0
             - name: RequestRateLimiter
               args:
                 redis-rate-limiter.replenishRate: 10
                 redis-rate-limiter.burstCapacity: 20
 
-        # 2. 数据源服务健康检查路由
-        - id: route-data-source-health
-          uri: lb://data-source-service
-          predicates:
-            - Path=/api/data-source/actuator/**
-          filters:
-            - StripPrefix=2
-            - RewritePath=/api/data-source/actuator/(?<segment>.*), /actuator/${segment}
-
-        # 3. 任务管理服务 API 路由
+        # 3. 任务管理服务 API 路由（控制器为 /api/tasks）
         - id: route-task-management-api
           uri: lb://task-management-service
           predicates:
-            - Path=/api/task/**
+            - Path=/api/tasks/**
           filters:
             - StripPrefix=0
             - name: RequestRateLimiter

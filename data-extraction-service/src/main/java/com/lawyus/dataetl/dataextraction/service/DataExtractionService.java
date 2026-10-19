@@ -7,6 +7,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -38,6 +39,9 @@ public class DataExtractionService {
 
     @Value("${data.extract.batch-size}")
     private int batchSize;
+
+    @Value("${etl.legacy.redis-status-ttl-hours:24}")
+    private long redisStatusTtlHours;
 
     public void processTask(EtlTaskMessage taskRequest) {
         EtlTaskMessage.DataSource dataSource = taskRequest.getDataSource();
@@ -236,6 +240,9 @@ public class DataExtractionService {
         recordsInfo.put("completedRecords", "0");
 
         redisTemplate.opsForHash().putAll(redisKey, recordsInfo);
-        log.info("Initialized Redis shard counter for task {}: totalRecords={}, completedRecords=0", taskId, totalRecords);
+        // 旧链路状态键是展示缓存，不是 completion 真源；没有 TTL 会在 Redis 中永久堆积。
+        redisTemplate.expire(redisKey, redisStatusTtlHours, TimeUnit.HOURS);
+        log.info("Initialized Redis shard counter for task {}: totalRecords={}, completedRecords=0, ttlHours={}",
+                taskId, totalRecords, redisStatusTtlHours);
     }
 }
