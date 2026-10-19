@@ -11,7 +11,10 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
 - Full suite: `mvn test` — this is the verification gate every slice must pass before it is considered done.
 - Integration tests (`orchestrator-design.md` §12.1) live in `task-management-service/src/test/java/.../it/`, are tagged `it`, and are **excluded** from `mvn test`.
   Run them with `mvn -pl task-management-service -am test -Pit` (or `-Dtest=*IT` for only the ITs). They need
-  `docker compose up -d postgres redis kafka`; when infra is absent the cases **skip, not fail**. They use a dedicated
+  `docker compose up -d postgres redis kafka`; when infra is absent the cases **skip, not fail** (so a green `mvn test`
+  proves nothing about them — always check `Skipped: 0` in the `-Pit` output). Any Redis answering on `localhost:6379`
+  works, since the ITs only use it for Redisson locks — if another local stack already holds that port, the repo's own
+  `redis` container is unnecessary (compose failing to bind it is harmless for the ITs). They use a dedicated
   database `etl_it` (auto-created, schema applied from `db/schema/02|05|06`) and per-JVM Kafka topic names, so they never
   touch the `etl_system` database used by the e2e runbook.
 - `FullChainE2EIT` boots the real `etl-worker` Spring context in the same test JVM (test-scope dependency on `etl-worker`);
@@ -66,6 +69,11 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
   the update throws `TransactionRequiredException`, which escapes the listener and re-triggers delivery forever.
 - `attempt_no` restarts at 1 for every new run (§5.1 T1 / D-22). `ux_run_task_attempt` is a **partial** index
   (`WHERE is_current`) for exactly that reason — do not make `attempt_no` task-monotonic to "fix" a duplicate-key error.
+- `etl_task_run` counter columns (`shard_succeeded/failed/skipped`, `rows_*`) are an **absolute-value mirror** of the
+  checkpoint aggregate (`RunCounterProjector`), never an increment — at-least-once delivery projects the same aggregate
+  repeatedly. They deliberately exclude `shard_total`, which is the T2 *plan* count and the basis of G-4/convergence;
+  projecting over it would zero it while no shards exist. Without the mirror those columns stay 0 and §12.2 check 2
+  passes vacuously (`rows_out + rows_dropped <> rows_in` is false when all three are 0).
 
 ## Toolchain
 

@@ -53,19 +53,22 @@ public class OrchestratorService implements OrchestratorEngine {
     private final OrchestratorMetrics metrics;
     private final DomainEventPublisher eventPublisher;
     private final OrchestratorProperties properties;
+    private final RunCounterProjector counterProjector;
 
     public OrchestratorService(EtlTaskRunRepository runRepository,
                                EtlTaskRepository taskRepository,
                                GuardChain guardChain,
                                OrchestratorMetrics metrics,
                                DomainEventPublisher eventPublisher,
-                               OrchestratorProperties properties) {
+                               OrchestratorProperties properties,
+                               RunCounterProjector counterProjector) {
         this.runRepository = runRepository;
         this.taskRepository = taskRepository;
         this.guardChain = guardChain;
         this.metrics = metrics;
         this.eventPublisher = eventPublisher;
         this.properties = properties;
+        this.counterProjector = counterProjector;
     }
 
     /**
@@ -150,8 +153,12 @@ public class OrchestratorService implements OrchestratorEngine {
     }
 
     /**
-     * 同一迁移事务内的副作用（时间戳、attempt、reason）。不改 status（status 已由 CAS 落定）。
+     * 同一迁移事务内的副作用（时间戳、attempt、reason、计数快照）。不改 status（status 已由 CAS 落定）。
      * shard 重置、audit 落表、DLT 关联等依赖额外基础设施的副作用留待后续切片。
+     *
+     * <p>凡“结果已定局”的目标态都顺手做一次计数投影（{@link RunCounterProjector}）：
+     * results 驱动的收敛已在监听器里投过，这里的重投是为了覆盖
+     * <b>没有 results 消息的终局</b>（T9/T13/T16 由 sweeper 直接驱动），否则 run 行计数会停在中间值。
      */
     private void applySideEffects(EtlTaskRun run, EtlTaskStatus from, EtlTaskStatus to, TransitionContext ctx) {
         String runId = run.getRunId();
@@ -178,18 +185,24 @@ public class OrchestratorService implements OrchestratorEngine {
                 break;
             case NEEDS_ATTENTION:
                 runRepository.markFinished(runId, null, summarize(ctx, from, to));
+                counterProjector.project(runId);
+                break;
+            case PARTIAL_SUCCESS:
+                // 收敛但带失败：同样落一版计数快照（§12.2 校验 2 要求 run 行与 checkpoint 一致）
+                counterProjector.project(runId);
                 break;
             case SUCCEEDED:
             case FAILED:
             case CANCELLED:
                 runRepository.markFinished(runId, now,
                         to == FAILED || to == CANCELLED ? summarize(ctx, from, to) : null);
+                counterProjector.project(runId);
                 break;
             case SUPERSEDED:
                 runRepository.clearCurrent(runId);
                 break;
             default:
-                // CREATED/VALIDATED/PARTIAL_SUCCESS：本切片无额外副作用
+                // CREATED/VALIDATED：本切片无额外副作用
                 break;
         }
     }

@@ -330,6 +330,16 @@ public abstract class AbstractOrchestratorIT {
         return jdbc.queryForObject("SELECT " + column + " FROM etl_task_run WHERE run_id = ?", Date.class, runId);
     }
 
+    /**
+     * run 行的数值列（计数投影断言用）：{@code shard_*} 与 {@code rows_*} 统一按 long 读回，
+     * 便于与 {@link com.lawyus.dataetl.taskmanagement.orchestrator.RunAggregate} 直接对齐。
+     */
+    protected long runLongColumn(String runId, String column) {
+        Long value = jdbc.queryForObject("SELECT " + column + " FROM etl_task_run WHERE run_id = ?",
+                Long.class, runId);
+        return value == null ? 0L : value;
+    }
+
     protected String shardStatus(String runId, String shardId) {
         return jdbc.queryForObject("SELECT status FROM etl_task_checkpoint WHERE run_id = ? AND shard_id = ?",
                 String.class, runId, shardId);

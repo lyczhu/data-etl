@@ -96,6 +96,13 @@ class KafkaDataPlaneIT extends AbstractOrchestratorIT {
         awaitStatus(runId, SUCCEEDED);
         assertThat(taskStatus(taskId)).isEqualTo("SUCCEEDED");
         assertThat(runDateColumn(runId, "finished_at")).isNotNull();
+        // 计数投影：run 行必等于 checkpoint 聚合（不投影则这些列停在 0，§12.2 校验 2 就恒空转）
+        assertThat(runLongColumn(runId, "shard_succeeded")).isEqualTo(2L);
+        assertThat(runLongColumn(runId, "shard_failed")).isZero();
+        assertThat(runLongColumn(runId, "rows_in")).isEqualTo(15L);
+        assertThat(runLongColumn(runId, "rows_out")).isEqualTo(15L);
+        assertThat(runLongColumn(runId, "rows_dropped")).isZero();
+        assertThat(runLongColumn(runId, "shard_total")).as("T2 写入的计划数不得被投影覆盖").isEqualTo(2L);
     }
 
     @Test
@@ -127,6 +134,14 @@ class KafkaDataPlaneIT extends AbstractOrchestratorIT {
                 assertThat(jdbc.queryForObject("SELECT last_progress_ts FROM etl_task_run WHERE run_id = ?",
                         java.util.Date.class, runId).getTime()).isGreaterThanOrEqualTo(ts));
         assertThat(runStatus(runId)).isEqualTo(RUNNING);
+        // 未定局也要投影：run 行已反映“1 个分片完事”，而不是停在初始 0 等终态才准。
+        // 投影来自 results，哨兵来自 progress：两个 topic 不保证先后，故等它而不是假定已到达。
+        Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(runLongColumn(runId, "shard_succeeded")).as("中间态计数已投影").isEqualTo(1L);
+            assertThat(runLongColumn(runId, "rows_in")).isEqualTo(10L);
+            assertThat(runLongColumn(runId, "rows_out")).isEqualTo(10L);
+        });
+        assertThat(runStatus(runId)).as("分片未全部落定，不得定局").isEqualTo(RUNNING);
     }
 
     @Test

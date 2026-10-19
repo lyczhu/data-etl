@@ -60,6 +60,10 @@ class ConvergenceGuardIT extends AbstractOrchestratorIT {
         assertThat(runDateColumn(runId, "finished_at"))
                 .as("NEEDS_ATTENTION 非终态：不得写 finished_at（INV-10 的前提）").isNull();
         assertThat(taskStatus(taskId)).isEqualTo("NEEDS_ATTENTION");
+        // 计数快照同时落库，且原样反映不平——投影不得粉饰太平地把越量遮住
+        assertThat(runLongColumn(runId, "rows_in")).isEqualTo(100L);
+        assertThat(runLongColumn(runId, "rows_out")).isEqualTo(60L);
+        assertThat(runLongColumn(runId, "shard_succeeded")).isEqualTo(1L);
     }
 
     @Test
@@ -78,6 +82,10 @@ class ConvergenceGuardIT extends AbstractOrchestratorIT {
         assertThat(runStatus(runId)).isEqualTo(SUCCEEDED);
         assertThat(taskStatus(taskId)).isEqualTo("SUCCEEDED");
         assertThat(runDateColumn(runId, "finished_at")).isNotNull();
+        // rows_deduped 不入对账等式，但它是 run 行的一个真实列：不投影则它永远停在 0
+        assertThat(runLongColumn(runId, "rows_deduped")).as("幂等命中数也投影").isEqualTo(100L);
+        assertThat(runLongColumn(runId, "rows_in")).isEqualTo(100L);
+        assertThat(runLongColumn(runId, "rows_out")).isEqualTo(100L);
     }
 
     @Test

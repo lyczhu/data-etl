@@ -20,6 +20,7 @@ class ConvergencePolicyTest {
             @Override public Long getRowsIn() { return rowsIn; }
             @Override public Long getRowsOut() { return rowsOut; }
             @Override public Long getRowsDropped() { return rowsDropped; }
+            @Override public Long getRowsDeduped() { return 0L; }   // 不入对账等式（D-08），收敛判定用不到
         };
     }
 

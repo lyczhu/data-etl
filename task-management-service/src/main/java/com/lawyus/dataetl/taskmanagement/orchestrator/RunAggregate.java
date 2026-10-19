@@ -28,6 +28,12 @@ public interface RunAggregate {
 
     Long getRowsDropped();
 
+    /**
+     * 幂等命中数（{@code ON CONFLICT DO NOTHING}）。按 D-08 <b>不入</b>对账等式，
+     * 仅作 {@code etl_task_run.rows_deduped} 的投影来源（§4.2）。
+     */
+    Long getRowsDeduped();
+
     /** 是否仍有分片未进入终态（PENDING/ASSIGNED/RUNNING），用于 §7.5 收敛门。 */
     default boolean hasUnconverged() {
         return getPending() + getAssigned() + getRunning() > 0;

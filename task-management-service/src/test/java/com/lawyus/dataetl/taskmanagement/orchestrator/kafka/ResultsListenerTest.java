@@ -5,6 +5,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunAggregate;
+import com.lawyus.dataetl.taskmanagement.orchestrator.RunCounterProjector;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
@@ -36,6 +37,7 @@ class ResultsListenerTest {
     private EtlTaskCheckpointRepository checkpointRepository;
     private OrchestratorService orchestrator;
     private TokenBucket tokenBucket;
+    private RunCounterProjector counterProjector;
     private ResultsListener listener;
 
     @BeforeEach
@@ -44,9 +46,10 @@ class ResultsListenerTest {
         checkpointRepository = mock(EtlTaskCheckpointRepository.class);
         orchestrator = mock(OrchestratorService.class);
         tokenBucket = mock(TokenBucket.class);
+        counterProjector = mock(RunCounterProjector.class);
         listener = new ResultsListener(new ObjectMapper(), runRepository, checkpointRepository,
                 orchestrator, mock(OrchestratorMetrics.class), new OrchestratorProperties(),
-                new RoutingProperties(), tokenBucket);
+                new RoutingProperties(), tokenBucket, counterProjector);
     }
 
     private EtlTaskRun runWith(String status, int shardTotal) {
@@ -68,6 +71,7 @@ class ResultsListenerTest {
             @Override public Long getRowsIn() { return rowsIn; }
             @Override public Long getRowsOut() { return rowsOut; }
             @Override public Long getRowsDropped() { return rowsDropped; }
+            @Override public Long getRowsDeduped() { return 0L; }
         };
     }
 
@@ -91,6 +95,7 @@ class ResultsListenerTest {
         listener.handle(msg());
 
         verify(tokenBucket).releaseWithinCapacity(1);
+        verify(counterProjector).project(eq("run-1"), any(RunAggregate.class));
         verify(orchestrator).transition(eq("run-1"), eq(EtlTaskStatus.RUNNING),
                 eq(EtlTaskStatus.SUCCEEDED), any(TransitionContext.class));
     }
@@ -120,13 +125,14 @@ class ResultsListenerTest {
     }
 
     @Test
-    @DisplayName("仍有活跃分片 → 不收敛、不迁移")
+    @DisplayName("仍有活跃分片 → 不收敛、不迁移，但计数仍投影（中间态不准是 bug）")
     void notConvergedNoTransition() {
         when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(runWith("RUNNING", 3)));
         when(checkpointRepository.aggregate("run-1")).thenReturn(agg(0, 1, 1, 1, 0, 0, 50, 50, 0));
 
         listener.handle(msg());
 
+        verify(counterProjector).project(eq("run-1"), any(RunAggregate.class));
         verify(orchestrator, never()).transition(any(), any(), any(), any());
     }
 
@@ -148,13 +154,14 @@ class ResultsListenerTest {
     }
 
     @Test
-    @DisplayName("终态 run 的重复 results → 幂等忽略（仅归还令牌）")
+    @DisplayName("终态 run 的重复 results → 幂等忽略（仅归还令牌，不投影不迁移）")
     void terminalRunIgnored() {
         when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(runWith("SUCCEEDED", 2)));
 
         listener.handle(msg());
 
         verify(orchestrator, never()).transition(any(), any(), any(), any());
+        verify(counterProjector, never()).project(any(), any());
         verify(tokenBucket, times(1)).releaseWithinCapacity(anyInt());
     }
 }

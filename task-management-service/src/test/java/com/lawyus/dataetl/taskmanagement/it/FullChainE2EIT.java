@@ -114,22 +114,34 @@ class FullChainE2EIT extends AbstractOrchestratorIT {
         assertThat(aggregate.getRowsDropped()).isZero();
         assertThat(aggregate.isBalanced()).as("G-4 对账等式（§12.2 校验 2 的真实口径）").isTrue();
 
+        // 计数投影：run 行必镜像 checkpoint 聚合，否则下面校验 2 的字面 SQL 会因两边同为 0 而空转通过
+        assertThat(runLongColumn(runId, "shard_succeeded")).as("分片成功数投影到 run 行")
+                .isEqualTo(aggregate.getSucceeded());
+        assertThat(runLongColumn(runId, "shard_failed")).isEqualTo(aggregate.getFailed());
+        assertThat(runLongColumn(runId, "shard_skipped")).isEqualTo(aggregate.getSkipped());
+        assertThat(runLongColumn(runId, "rows_in")).isEqualTo(ItInfra.SOURCE_ROWS);
+        assertThat(runLongColumn(runId, "rows_out")).isEqualTo(ItInfra.SOURCE_ROWS);
+        assertThat(runLongColumn(runId, "rows_dropped")).isZero();
+        assertThat(runLongColumn(runId, "rows_deduped")).isEqualTo(aggregate.getRowsDeduped());
+        assertThat(runLongColumn(runId, "shard_total")).as("T2 写入的分片计划数不得被投影覆盖").isEqualTo(3L);
+
         assertThat(taskStatus(taskId)).as("INV-6").isEqualTo("SUCCEEDED");
         assertThat(runColumn(runId, "started_at")).isNotNull();
         assertThat(runColumn(runId, "dispatched_at")).isNotNull();
         assertThat(runDateColumn(runId, "finished_at")).isNotNull();
 
-        assertDesignDocInvariantsHold();
+        assertDesignDocInvariantsHold(runId);
     }
 
     /**
      * §12.2 nightly 一致性校验的四条 SQL 在真库上必须返空。
      *
-     * <p>诚实标注：校验 2 的字面形式比的是 {@code etl_task_run.rows_*}，而 Phase 1 尚未把
-     * checkpoint 计数投影到 run 行（这些列恒为 0，故字面校验"空转通过"）；本用例因此同时断言
-     * 了上面 {@link RunAggregate} 的真实口径。
+     * <p>校验 2 的字面形式比的是 {@code etl_task_run.rows_*}，所以先断言 {@code rows_in} 已非 0：
+     * 否则“run 行恒为 0 → 等式两边同 0 → 永远返空”会伪装成通过（本轮补上计数投影前正是这个形态）。
      */
-    private void assertDesignDocInvariantsHold() {
+    private void assertDesignDocInvariantsHold(String runId) {
+        assertThat(runLongColumn(runId, "rows_in"))
+                .as("非空转守卫：校验 2 比的是 run 行列，它必须已被投影成真值").isPositive();
         assertThat(jdbc.queryForList("SELECT t.task_id FROM etl_task t JOIN etl_task_run r "
                         + "ON r.task_id = t.task_id AND r.is_current WHERE t.status <> r.status"))
                 .as("校验 1（INV-6）：task.status 必等于 current run.status").isEmpty();

@@ -543,6 +543,15 @@ SELECT status, COUNT(*) AS shards,
 
 **跨 attempt 的对账连续性**：自动重试（T12/T21）在同一 `run_id` 内进行，checkpoint PK 含 `run_id` 但行不被复制，`rows_in/out` 以 `GREATEST(旧值, 旧值+本次增量)` 累加，因此 G-4 在任意 attempt 后仍可判定。人工 `scope=full` 新建 run 时 checkpoint 全新（`rows_*` 从 0 起），等式自洽。
 
+**run 行计数列的投影写入点**（已落地：`orchestrator/RunCounterProjector`）：`etl_task_run` 的 `shard_succeeded/failed/skipped` 与 `rows_in/out/dropped/deduped` 是上述聚合的**镜像**，不是自增计数。两个写入点各自必要：
+
+| 写入点 | 时机 | 为何不可省 |
+|---|---|---|
+| `ResultsListener` | 每条 results 聚合后，**含尚未收敛的中间态** | 只在终态投影的话，运行中的 run 行进度恒为 0，既无法观测也支撑不了 §9 的 `GET /progress` |
+| `OrchestratorService.applySideEffects` | 进入 `SUCCEEDED`/`PARTIAL_SUCCESS`/`FAILED`/`CANCELLED`/`NEEDS_ATTENTION` 时 | sweeper 驱动的终局（T9/T13/T16）根本不会产生 results 消息 |
+
+三条约束缺一不可：只写非 status 列（不得构成第二状态写路径）；**绝对值覆写**而非累加（至少一次投递下重复投影无害，累加则必双计）；**不动 `shard_total`** —— 它是 T2 写入的分片**计划数**，同时是 G-4 与收敛判定的基准，被「已建分片数」覆盖会在无分片时归 0，属自我污染。另：投影也不刷 `updated_at`，否则终态 run 会因原地更新而误触 §12.2 校验 3。
+
 **语义边界说明（解释性，不构成新增约束）**：本节收敛判定属于「**无全局 barrier**」一类——checkpoint 由 worker 按 shard 自治直写，不存在协调者发起的一致性时刻，因此 `SUCCEEDED` 的语义是「聚合重算后行数对账平衡」，**不等价于** Flink / SeaTunnel 那种由 checkpoint barrier + sink 2PC 预提交支撑的 exactly-once。同类做法可对照 Kafka Connect（offset 按间隔提交，官方明确只有 at-least-once）与 DolphinScheduler（终态由 DB 聚合得出）。对外表述一致性能力时，口径统一为 **at-least-once + 各跳幂等**（`ON CONFLICT` upsert），不写 exactly-once。参见 `mainstream-etl-task-state-patterns.md §2.1 / §3（不变式 5）`。
 
 **流模式（stream profile）差异**：常驻 run 无「所有 shard 收敛」概念，G-2/G-4 不适用；改由 `etl.checkpoint.lag`（`now - max(checkpoint.updated_at)`）与 Kafka lag 指标驱动 `NEEDS_ATTENTION`，`results` 消息不产生。
@@ -869,6 +878,7 @@ rg -n "setStatus\(" task-management-service/src | rg -v "EtlTaskService.java|orc
 | DLT 死循环 | — | ❌ 不能 IT：需 §9 `/retry` API + Phase 2 `07-etl-task-dlt.sql` 的 `resolved` 回写；已实现的两半（行级毒→`NEEDS_ATTENTION`、协议类毒不改状态）由 `KafkaDataPlaneIT` 真 broker 覆盖 |
 | 时间推进 | `SweeperIT.backoffSchedule_isExactFromConfiguredTiers`（t0+5m 精确）+ T8/T9/T21/T30/T31/T32 各用例 | ✅ attempt 耗尽走 T9/T22 均有断言 |
 | 非法消息不重试 | `KafkaDataPlaneIT.poisonPayload_doesNotStallTheContainer` | ✅ 断言消费位点真前移（AdminClient 读 committed offset） |
+| 计数投影（§12.2 校验 2 的前提） | `KafkaDataPlaneIT.results_*`（中间态与终态）、`ConvergenceGuardIT`（不平原样可见 + `rows_deduped` 落库）、`SweeperIT.dispatchTimeout_attemptsExhausted_*`（**零 results** 的终局）、`FullChainE2EIT`（非空转守卫） | ✅ run 行镜像 checkpoint 聚合，且 `shard_total`（T2 计划数）不被覆盖 |
 
 未写在那张表里、但属于新链路核心的额外覆盖：入口链 V-1..V-4 与派工契约（`EntryChainIT`）、
 §7.3/§7.5/§7.6 三个监听器的真 broker 往返（`KafkaDataPlaneIT`）、以及含真 `etl-worker` 进度的
@@ -888,6 +898,8 @@ SELECT t.task_id, t.status AS task_status, r.status AS run_status
  WHERE t.status <> r.status;
 
 -- 校验 2（INV-4）：SUCCEEDED 的 run 行数必平
+-- 注意：本查询比的是 etl_task_run.rows_*，依赖 §7.5 的计数投影；无投影时这些列恒为 0，
+-- 等式两边同 0 会“空转通过”（FullChainE2EIT 内置 rows_in > 0 的非空转守卫）
 SELECT ru.run_id, a.rows_in, a.rows_out, a.rows_dropped
   FROM etl_task_run ru
   JOIN (SELECT run_id, SUM(rows_in) rows_in, SUM(rows_out) rows_out,
@@ -940,6 +952,7 @@ SELECT task_id, COUNT(*) FROM etl_task_run
 | 10 | 穷举迁移单测 + §12.1 全部用例 | `task-management-service/src/test/java/.../orchestrator/` |
 | 11 | 图源同步（按 §8.2 9 条差异） | `docs/architecture/target-lifecycle-states.dot` |
 | 12 | `OrchestratorEngine` 预留抽象（方案 §2.1/§9.4 后门） | `.../orchestrator/OrchestratorEngine.java` |
+| 13 | run 行计数投影（§7.5；§12.2 校验 2 不空转的前提） | `.../orchestrator/RunCounterProjector.java` |
 
 > 注意：`jpa.hibernate.ddl-auto: update`（`task-management-service.yml:14`）**不会创建部分唯一索引与 CHECK 约束**，所以 `05/06` 脚本必要手工执行，不得依赖 Hibernate。Phase 1 结束后建议将 `ddl-auto` 降为 `validate`，以脚本为唯一真源。
 

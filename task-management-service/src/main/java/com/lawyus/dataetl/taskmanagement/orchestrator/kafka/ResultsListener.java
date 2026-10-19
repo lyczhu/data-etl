@@ -9,6 +9,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionExce
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunAggregate;
+import com.lawyus.dataetl.taskmanagement.orchestrator.RunCounterProjector;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
@@ -33,6 +34,7 @@ import java.util.Optional;
  * 等下一批 results 或 sweeper 兜底。
  *
  * <p>每条 results 代表一个分片跑完，归还 1 个令牌（{@link TokenBucket#releaseWithinCapacity} 防重复投递超发）。
+ * 聚合结果同时用于 {@link RunCounterProjector} 的计数投影（含未收敛的中间态），使 run 行不再停着 0。
  */
 @Component
 public class ResultsListener {
@@ -47,6 +49,7 @@ public class ResultsListener {
     private final OrchestratorProperties properties;
     private final RoutingProperties routing;
     private final TokenBucket tokenBucket;
+    private final RunCounterProjector counterProjector;
 
     public ResultsListener(ObjectMapper objectMapper,
                            EtlTaskRunRepository runRepository,
@@ -55,7 +58,8 @@ public class ResultsListener {
                            OrchestratorMetrics metrics,
                            OrchestratorProperties properties,
                            RoutingProperties routing,
-                           TokenBucket tokenBucket) {
+                           TokenBucket tokenBucket,
+                           RunCounterProjector counterProjector) {
         this.objectMapper = objectMapper;
         this.runRepository = runRepository;
         this.checkpointRepository = checkpointRepository;
@@ -64,6 +68,7 @@ public class ResultsListener {
         this.properties = properties;
         this.routing = routing;
         this.tokenBucket = tokenBucket;
+        this.counterProjector = counterProjector;
     }
 
     @KafkaListener(topics = "${etl.topics.results}", groupId = "task-management-group")
@@ -113,6 +118,9 @@ public class ResultsListener {
         }
 
         RunAggregate a = checkpointRepository.aggregate(run.getRunId());
+        // 计数投影放在收敛门之前：未定局的中间态也要随分片推进更新 run 行计数（复用现成聚合值，不重查）。
+        // 终态路径会在 transition 的副作用里再投一次作快照（覆盖 sweeper 驱动、根本没有 results 的终局）。
+        counterProjector.project(run.getRunId(), a);
         int shardTotal = run.getShardTotal() == null ? 0 : run.getShardTotal();
         boolean cancelRequested = run.getCancelRequestedAt() != null;
         ConvergencePolicy.Outcome outcome = ConvergencePolicy.evaluate(a, shardTotal, cancelRequested);

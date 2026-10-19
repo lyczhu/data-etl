@@ -86,6 +86,38 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
     @Query("UPDATE EtlTaskRun r SET r.shardTotal = :shardTotal WHERE r.runId = :runId")
     int setShardTotal(@Param("runId") String runId, @Param("shardTotal") int shardTotal);
 
+    /**
+     * 计数投影（§4.2）：把 checkpoint 聚合的<b>绝对值</b>覆写进 run 行的汇总列
+     * （{@code shard_succeeded/failed/skipped} 与 {@code rows_*}）。
+     *
+     * <p>三条约束缺一不可：
+     * <ul>
+     *   <li>只写非 status 列，维持“status 唯一写路径是 {@link #casStatus}”的守卫（§11.3）；</li>
+     *   <li><b>覆写而非累加</b>：至少一次投递下同一聚合会被投影多次，绝对值才幂等；</li>
+     *   <li>不动 {@code shard_total}：它是 T2 写入的<b>分片计划数</b>，而非 checkpoint 派生的进度值；
+     *       G-4（{@code GuardChain}）与收敛判定（{@code ConvergencePolicy}）都以它为基准，
+     *       被投影覆盖会拿“已建分片数”污染“计划数”（无分片时直接归 0）。</li>
+     * </ul>
+     *
+     * <p>也不刷 {@code updated_at}：该列只由状态写入方维护，否则终态 run 会因投影而
+     * 违反 §12.2 校验 3（“终态后不得再被原地更新”）。
+     *
+     * <p>自带写事务：{@code ResultsListener} 的调用点在事务之外（与 {@link #touchProgress} 同理）。
+     */
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE EtlTaskRun r SET r.shardSucceeded = :shardSucceeded, r.shardFailed = :shardFailed, "
+            + "r.shardSkipped = :shardSkipped, r.rowsIn = :rowsIn, r.rowsOut = :rowsOut, "
+            + "r.rowsDropped = :rowsDropped, r.rowsDeduped = :rowsDeduped WHERE r.runId = :runId")
+    int projectCounters(@Param("runId") String runId,
+                        @Param("shardSucceeded") int shardSucceeded,
+                        @Param("shardFailed") int shardFailed,
+                        @Param("shardSkipped") int shardSkipped,
+                        @Param("rowsIn") long rowsIn,
+                        @Param("rowsOut") long rowsOut,
+                        @Param("rowsDropped") long rowsDropped,
+                        @Param("rowsDeduped") long rowsDeduped);
+
     /** 软取消标记（T27/D-18），不触碰 status。 */
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskRun r SET r.cancelRequestedAt = :ts WHERE r.runId = :runId")

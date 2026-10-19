@@ -80,12 +80,18 @@ class SweeperIT extends AbstractOrchestratorIT {
     void dispatchTimeout_attemptsExhausted_goesNeedsAttention() {
         String taskId = seedTask(ItInfra.SOURCE_TABLE, "it_target_exhausted");
         String runId = seedDispatchedRun(taskId, Duration.ofSeconds(30), orchProps.getMaxAttempts());
+        // 上一 attempt 已读过几行就挂了：FAILED 不是活跃分片，不影响本用例的 T9 判定
+        seedCheckpoint(taskId, runId, "shard-0", EtlShardStatus.FAILED, 7, 3, 0);
 
         orchProps.setDispatchHeartbeatTimeout(Duration.ofSeconds(10));
         dispatchTimeoutSweeper.sweep();
 
         assertThat(runStatus(runId)).isEqualTo(NEEDS_ATTENTION);
         assertThat(runColumn(runId, "error_summary")).contains("NO_WORKER_HEARTBEAT");
+        // 全程没有一条 results 消息：计数快照必须由迁移自已完成，否则 run 行停在 0
+        assertThat(runLongColumn(runId, "rows_in")).as("sweeper 驱动的终局也要投影").isEqualTo(7L);
+        assertThat(runLongColumn(runId, "rows_out")).isEqualTo(3L);
+        assertThat(runLongColumn(runId, "shard_failed")).isEqualTo(1L);
     }
 
     @Test

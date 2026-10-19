@@ -18,7 +18,7 @@ import java.util.List;
  *
  * <p>写权矩阵（§4.1）规定 checkpoint 由 worker 直写，orchestrator 仅在此做：
  * <ul>
- *   <li>{@link #aggregate} — 收敛判定与 guard 的单次 SQL 聚合（走 {@code idx_checkpoint_run_status}）；</li>
+ *   <li>{@link #aggregate} — 收敛判定、guard 与计数投影的单次 SQL 聚合（走 {@code idx_checkpoint_run_status}）；</li>
  *   <li>{@link #touch} — progress 心跳仅刷新 {@code updated_at}，不改 shard 状态（§7.3）；</li>
  *   <li>{@link #countActiveShards} — quiesce（G-3）判定。</li>
  * </ul>
@@ -28,7 +28,8 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
 
     /**
      * 单次聚合：按状态分桶计数 + 行数列求和，映射为 {@link RunAggregate}。
-     * COALESCE 保证无分片时各列为 0（而非 null）。
+     * COALESCE 保证无分片时各列为 0（而非 null）；该聚合同时是
+     * {@code etl_task_run} 计数列的唯一投影源（见 {@code RunCounterProjector}）。
      */
     @Query(value = "SELECT "
             + " COALESCE(SUM(CASE WHEN status = 'PENDING'   THEN 1 ELSE 0 END), 0) AS pending,   "
@@ -39,7 +40,8 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
             + " COALESCE(SUM(CASE WHEN status = 'SKIPPED'   THEN 1 ELSE 0 END), 0) AS skipped,   "
             + " COALESCE(SUM(rows_in), 0)      AS rowsIn,      "
             + " COALESCE(SUM(rows_out), 0)     AS rowsOut,     "
-            + " COALESCE(SUM(rows_dropped), 0) AS rowsDropped  "
+            + " COALESCE(SUM(rows_dropped), 0) AS rowsDropped, "
+            + " COALESCE(SUM(rows_deduped), 0) AS rowsDeduped  "
             + "FROM etl_task_checkpoint WHERE run_id = :runId",
             nativeQuery = true)
     RunAggregate aggregate(@Param("runId") String runId);
