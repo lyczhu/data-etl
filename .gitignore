@@ -64,9 +64,6 @@ monitoring/alert-logs/
 *.tmp
 arthas-output/
 
-# Docs
-docs/
-
 # Node (for frontend in same repo)
 node_modules/
 

@@ -1,0 +1,78 @@
+// data-etl 容器级架构图（L2，当前基线：本会话修复后）
+// 由 system-modeler + architecture-health 刷新；渲染：dot -Tsvg architecture-container-view.dot -o architecture-container-view.svg
+// 置信度：H=high(代码/配置直证) M=medium I=inferred；⚠=历史问题(已修复则标注 fixed)
+digraph "data-etl-containers" {
+    rankdir=TB;
+    fontname="Microsoft YaHei";
+    node [fontname="Microsoft YaHei", fontsize=11];
+    edge [fontname="Microsoft YaHei", fontsize=9];
+
+    actor [label="运维/使用者\n(curl · test-scripts · 前端)", shape=oval, style=dashed];
+
+    subgraph cluster_infra {
+        label="基础设施 / 平台服务";
+        style=dashed;
+        registry  [label="registry\nEureka 注册中心 :8761", shape=box];
+        configsvr [label="config-server :8050\nnative config-repo + config-monitor\nbus-kafka 广播路由刷新 (admin/config123)", shape=box];
+        pg        [label="PostgreSQL+PostGIS :5433\netl_system 库 (ddl-auto=update)", shape=cylinder];
+        redis     [label="Redis :6379\ntask:scheduler:lock (Redisson)\ntask:status:{id} 计数 | etl:dedup:{id}:{pk} 去重", shape=cylinder];
+        kafka     [label="Kafka :9092 (KRaft 单机)", shape=cylinder];
+    }
+
+    gateway [label="gateway-service :8080\nSpring Cloud Gateway (fixed 8081→8080)\n9 路由(含 user-service) + JwtAuthGlobalFilter\n限流(RedisRateLimiter) + 日志过滤器", shape=box];
+
+    subgraph cluster_etl {
+        label="ETL 核心链路";
+        style=dashed;
+        task_mgmt   [label="task-management-service :8082\n/api/tasks · @Scheduled(30s)\nFeign→data-source · 建目标表\n消费 task-completed/task-failed", shape=box];
+        data_source [label="data-source-service :8081\n/api/data-sources CRUD\ndata_source 表", shape=box];
+        extraction  [label="data-extraction-service :8083\nDynamicDataSource 直连源库 · batch 1000\n失败有界重试(≤3)+发布 task-failed", shape=box];
+        transform   [label="data-transformation-service :8084\n线程池并行转换\nsend transformed-data (fixed)+spring-retry", shape=box];
+        storage     [label="data-storage-service :8085\n单行对象(fixed isArray)+幂等去重\n批量 INSERT(ST_GeomFrom*)+插入重试", shape=box];
+    }
+
+    user_svc [label="user-service :8086\nJWT 登录/用户/角色/权限\nsys_user|role|permission", shape=box];
+
+    // 同步调用
+    actor -> gateway    [label="HTTP /api/**（需 Bearer，除白名单）(H)"];
+    actor -> user_svc   [label="HTTP /api/auth/login (H: 网关已路由 + 白名单)"];
+    gateway -> registry [label="discovery(lb://)" style=dotted];
+    gateway -> data_source [label="route"];
+    gateway -> task_mgmt   [label="route"];
+    gateway -> extraction  [label="route"];
+    gateway -> transform   [label="route"];
+    gateway -> storage     [label="route"];
+    gateway -> user_svc    [label="route /api/auth|users|roles"];
+
+    task_mgmt   -> data_source [label="Feign: GET /api/data-sources/{id} (H)"];
+    storage     -> task_mgmt   [label="Feign: GET /api/tasks/task-id/{taskId} (H)"];
+
+    // 配置中心拉取 + bus 路由刷新
+    configsvr -> gateway    [label="config + bus-kafka 刷新路由" style=dotted];
+    configsvr -> task_mgmt  [label="spring.config.import" style=dotted];
+    configsvr -> extraction [label="spring.config.import" style=dotted];
+    configsvr -> transform  [label="spring.config.import" style=dotted];
+    configsvr -> storage    [label="spring.config.import" style=dotted];
+    configsvr -> user_svc   [label="spring.config.import" style=dotted];
+
+    // 服务注册
+    { data_source task_mgmt extraction transform storage user_svc } -> registry [label="eureka client" style=dotted];
+
+    // 数据/中间件访问
+    { data_source task_mgmt transform storage user_svc } -> pg [label="JPA/JDBC 读写" style=dotted];
+    task_mgmt -> redis [label="RLock tryLock" style=dotted];
+    extraction -> redis [label="HSET totalRecords" style=dotted];
+    storage -> redis [label="去重标记 + HINCRBY completedRecords" style=dotted];
+
+    // Kafka 异步流（5 topic，详见 etl-task-lifecycle-flow.dot）
+    task_mgmt  -> kafka [label="produce task-request"];
+    kafka      -> extraction [label="consume task-request"];
+    extraction -> kafka [label="produce raw-data"];
+    kafka      -> transform [label="consume raw-data"];
+    transform  -> kafka [label="produce transformed-data (fixed)"];
+    kafka      -> storage [label="consume transformed-data"];
+    storage    -> kafka [label="produce task-completed"];
+    kafka      -> task_mgmt [label="consume task-completed"];
+    extraction -> kafka [label="produce task-failed (重试耗尽)" color=blue fontcolor=blue];
+    kafka      -> task_mgmt [label="consume task-failed → 回滚 failed" color=blue fontcolor=blue];
+}

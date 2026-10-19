@@ -1,0 +1,43 @@
+// ETL 任务生命周期与 Kafka 数据流（当前基线：本会话修复后）
+// 由 flow-visualizer + architecture-health 刷新；渲染：dot -Tsvg etl-task-lifecycle-flow.dot -o etl-task-lifecycle-flow.svg
+// 主题（config-repo）：task-request / raw-data / transformed-data / task-completed / task-failed
+digraph "etl-flow" {
+    rankdir=TB;
+    fontname="Microsoft YaHei";
+    node [fontname="Microsoft YaHei", fontsize=10];
+    edge [fontname="Microsoft YaHei", fontsize=9];
+
+    subgraph cluster_lifecycle {
+        label="任务状态机（etl_task.status，字符串字面量，无枚举约束）";
+        style=dashed;
+        new        [label="new\nPOST /api/tasks 创建", shape=doublecircle];
+        processing [label="processing\n扫描器抢占(持 Redisson 锁时置位)", shape=circle];
+        running    [label="running\n已发 task-request", shape=circle];
+        completed  [label="completed\n消费 task-completed", shape=doublecircle];
+        failed     [label="failed\n① processNewTask 异常 ② 消费 task-failed 回滚", shape=circle];
+
+        new        -> processing [label="@Scheduled 30s 扫描 findByStatus(\"new\")"];
+        processing -> running    [label="Feign取数据源→建目标表→发Kafka成功"];
+        processing -> failed     [label="建表/取数源/发消息异常(同步置位)"];
+        running    -> completed  [label="task-completed: completedRecords >= totalRecords"];
+        running    -> failed     [label="extraction 重试耗尽→发 task-failed 回滚(fixed)", color=blue fontcolor=blue];
+    }
+
+    subgraph cluster_pipeline {
+        label="数据流水线（每行数据一条 Kafka 消息，taskId 为 key）";
+        style=dashed;
+        t1 [label="task-request\ntask-management → extraction", shape=box3d];
+        t2 [label="raw-data\nextraction → transformation", shape=box3d];
+        t3 [label="transformed-data\ntransformation → storage (topic 已修正)", shape=box3d, color=green, fontcolor=green];
+        t4 [label="task-completed\nstorage → task-management", shape=box3d];
+        t5 [label="task-failed\nextraction → task-management (回滚)", shape=box3d, color=blue, fontcolor=blue];
+    }
+
+    ext_db [label="源业务库\n(DynamicDataSource 直连)", shape=cylinder];
+    dst_db [label="etl_system 目标表\n(TaskScheduler 按源表结构动态 CREATE，无 PK/索引)", shape=cylinder];
+
+    t1 -> t2 [label="MIN/MAX/COUNT 主键范围→Redis 计数初始化→WHERE id>=? LIMIT 1000 逐批拉取；异常→有界重试(≤3)，耗尽→t5"];
+    t2 -> t3 [label="线程池并行: 数值保留2位小数等默认规则; 批次手动 ack; 发送走 spring-retry"];
+    t3 -> dst_db [label="storage: 校验单行对象→taskId+id 幂等去重→Feign 查 targetTableName→批量 INSERT(ST_GeomFrom*), 失败重试"];
+    dst_db -> t4 [label="每条成功: HINCRBY completedRecords, 达到 totalRecords 时发送（去重防重复计数）"];
+}

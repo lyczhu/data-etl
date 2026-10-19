@@ -1,0 +1,105 @@
+// data-etl 架构补充风险 → 方案候选 → 取舍 矩阵（risk-quality-reviewer + graphviz 产出）
+// 视图状态：current(痛点) → proposed(方案)，边标签为取舍决策
+// 覆盖维度：A~M（A~G 见 architecture-overview.md / 演进方案；H~M 为本次补充）
+// 渲染：dot -Tsvg risk-tech-selection-matrix.dot -o risk-tech-selection-matrix.svg
+// 取舍标记：[推]=推荐首选  [评]=建议评估  [可]=可选增强  [不]=当前规模不建议
+digraph "risk-tech-selection" {
+    rankdir=TB;
+    fontname="Microsoft YaHei";
+    node [fontname="Microsoft YaHei", fontsize=10];
+    edge [fontname="Microsoft YaHei", fontsize=9];
+
+    // ---------- 痛点 (current-state) ----------
+    subgraph cluster_pain {
+        label="架构痛点 (current-state)";
+        style=dashed; color=gray;
+
+        A [label="A 链路长/串行\n4服务+3Kafka+2Feign\nFullGC风暴", color=red, fontcolor=red];
+        C [label="C 结束难判断\nRedis计数+COUNT快照漂移", color=red, fontcolor=red];
+        D [label="D 失败恢复难\n无checkpoint/续跑", color=red, fontcolor=red];
+        B [label="B 中间失败难定位\n无trace/DLT", color=orange, fontcolor=orange];
+        E [label="E 接入面窄+无流式\n仅JDBC,无文件/NoSQL/IoT", color=orange, fontcolor=orange];
+        H [label="H 数据正确性\n2位小数改写/强依赖id\ngeometry退化", color=red, fontcolor=red];
+        I [label="I 并行度天花板\ntaskId分区键→单任务串行\n幂等未开/无背压", color=red, fontcolor=red];
+        J [label="J 安全/合规\n口令入Kafka+DB明文\nJWT密钥入Git", color=red, fontcolor=red];
+        K [label="K 高可用/运维\nKafka/PG/Redis单点\n服务未编排", color=orange, fontcolor=orange];
+        L [label="L 契约/演进\n无Schema Registry\n网关路由不匹配/R4J空转", color=orange, fontcolor=orange];
+        M [label="M 数据治理\n目标表无清理\n去重窗口=TTL24h", color=gray, fontcolor=black];
+    }
+
+    // ---------- 方案候选 (proposed) ----------
+    subgraph cluster_sol_batch {
+        label="批处理/集成引擎"; style=rounded;
+        SPRINGBATCH [label="Spring Batch\nchunk/restart/skip/retry", shape=box];
+        SEATUNNEL   [label="Apache SeaTunnel\n多源connector+checkpoint", shape=box];
+        NIFI        [label="Apache NiFi\n背压+provenance+失败路由", shape=box];
+        DATAX       [label="DataX\n离线批同步", shape=box];
+        FIVETRAN    [label="Fivetran/Informatica\n商业SaaS ELT", shape=box, style=dashed];
+    }
+
+    subgraph cluster_sol_flow {
+        label="流处理/流批一体"; style=rounded;
+        KSTREAMS [label="Kafka Streams\n库形式/复用现有JVM+Kafka", shape=box];
+        FLINK    [label="Apache Flink\nexactly-once checkpoint/savepoint", shape=box];
+        VVP_CONF [label="Ververica/Confluent\nFlink商业化", shape=box, style=dashed];
+        SPARKSS  [label="Spark Structured Streaming", shape=box, style=dashed];
+    }
+
+    subgraph cluster_sol_orch {
+        label="编排/状态机/工作流"; style=rounded;
+        TEMPORAL  [label="Temporal/Cadence\n持久化工作流:代码即状态机\n自动重试/可取消/可续跑/执行历史", shape=box, color=blue];
+        DOLPHIN   [label="DolphinScheduler/Airflow\nDAG定时调度", shape=box];
+        SELFSTATE [label="自研状态机+outbox (plan原方案)", shape=box, style=dashed];
+    }
+
+    subgraph cluster_sol_gov {
+        label="契约/质量/可观测/安全"; style=rounded;
+        SCHEMAREG [label="Schema Registry\nAvro/Protobuf契约", shape=box, color=blue];
+        OTEL      [label="OpenTelemetry+Tempo+Loki", shape=box, color=blue];
+        DEEQU     [label="Great Expectations/deequ\n数据质量", shape=box];
+        VAULT     [label="Vault/KMS+Jasypt\n凭据加密", shape=box, color=red];
+        SEDONA    [label="GeoTools/Apache Sedona\n空间数据", shape=box];
+        ICEBERG   [label="Iceberg/Hudi/Paimon\n湖仓upsert", shape=box, style=dashed];
+    }
+
+    // ---------- 痛点 → 方案（边标签=取舍理由；虚线=当前规模不建议/暂缓）----------
+    A -> SPRINGBATCH [label="[推] 进程内合并 E-T-L"];
+    A -> SEATUNNEL   [label="[评] 引擎内跑替代", style=dotted];
+    A -> NIFI        [label="[评] 声明式流替代"];
+
+    C -> TEMPORAL    [label="[推] 状态机+执行历史"];
+    C -> SELFSTATE   [label="[推] plan 骨架"];
+
+    D -> SPRINGBATCH [label="[推] restart/skip/retry 原生"];
+    D -> TEMPORAL    [label="[推] 可续跑/补偿"];
+    D -> SEATUNNEL   [label="[评] checkpoint 断点", style=dotted];
+
+    H -> SEATUNNEL   [label="[推] 成熟 connector 免自研"];
+    H -> DEEQU       [label="[可] 入库前质量校验"];
+    H -> SEDONA      [label="[可] GeoJSON/几何处理"];
+
+    I -> SPRINGBATCH [label="[推] Partitioner 分片并行"];
+    I -> NIFI        [label="[推] 内置背压"];
+    I -> FLINK       [label="[评] 重, 按规模才上", style=dotted];
+
+    J -> VAULT       [label="[推] 必做, 与选型无关"];
+
+    K -> FLINK       [label="[评] HA 但运维重", style=dotted];
+    K -> DOLPHIN     [label="[可] 高可用调度"];
+
+    L -> SCHEMAREG   [label="[推] 消除手工 JSON"];
+    L -> KSTREAMS    [label="[评] 契约+DLQ 原生"];
+
+    M -> DEEQU       [label="[可] 血缘/质量"];
+    M -> ICEBERG     [label="[不] 目标库是 PG+PostGIS", style=dotted, color=gray];
+
+    E -> SEATUNNEL   [label="[推] 文件/NoSQL 源"];
+    E -> NIFI        [label="[推] 异构连接器+可视化"];
+    E -> DATAX       [label="[可] 仅批式异构"];
+    E -> FIVETRAN    [label="[不] 成本/空间语义弱", style=dotted, color=gray];
+    E -> KSTREAMS    [label="[推] IoT 轻量流式"];
+    E -> FLINK       [label="[评] 复杂状态才上", style=dotted];
+
+    B -> OTEL        [label="[推] trace 贯通"];
+    B -> NIFI        [label="[评] provenance 自带"];
+}

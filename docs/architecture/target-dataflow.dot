@@ -1,0 +1,69 @@
+// data-etl 目标态数据流（target-state）— 由 flow-visualizer + evolution-planner 产出
+// 配套：etl-architecture-evolution-plan.md §5
+// 渲染：dot -Tsvg target-dataflow.dot -o target-dataflow.svg
+// 要点：批数据面不再穿越 Kafka(仅控制面 dispatch/progress/results/dlt)；流式源经 Kafka 直连 worker
+digraph "target-dataflow" {
+    rankdir=TB;
+    fontname="Microsoft YaHei";
+    node [fontname="Microsoft YaHei", fontsize=10];
+    edge [fontname="Microsoft YaHei", fontsize=9];
+
+    subgraph cluster_sources {
+        label="异构入口 (connector-spi)"; style=dashed;
+        s_jdbc [label="MySQL/PG\nPK 范围分片 N 段", shape=cylinder];
+        s_mongo[label="Mongo\n_id 范围分片", shape=cylinder];
+        s_file [label="文件/对象 JSON/CSV/GeoJSON\n行区间/Feature 分片, >200MB spool", shape=box];
+        s_iot  [label="IoT (MQTT bridge) / CDC\nKafka source.iot.raw.*", shape=box];
+    }
+
+    orch [label="etl-orchestrator\n分片派工 + 状态机", shape=box];
+
+    subgraph cluster_topics {
+        label="Kafka (控制面)"; style=dashed;
+        tp_disp  [label="etl.task.dispatch.batch\n(一 shard 一消息: taskId,runId,shardId,pkFrom,pkTo)", shape=box3d];
+        tp_prog  [label="etl.task.progress\n(每 shard ≤1/5s)", shape=box3d];
+        tp_res   [label="etl.task.results", shape=box3d];
+        tp_dlt   [label="etl.task.dlt", shape=box3d];
+        tp_cmd   [label="etl.task.commands\n(cancel/pause/resume)", shape=box3d];
+        tp_src   [label="source.iot.raw.* / source.file.arrival", shape=box3d];
+    }
+
+    subgraph cluster_worker {
+        label="etl-worker 进程内 pipeline (batch)"; style=rounded;
+        reader [label="SourceReader\n流式游标 fetchSize", shape=box];
+        xform  [label="TransformerChain\n无损(取消2位小数改写)\nGeoTools/WKT-WKB 空间", shape=box];
+        sink   [label="SinkWriter\n真批/COPY + upsert 幂等\nidempotencyKey", shape=box];
+        ckpt   [label="checkpoint+outbox\n(每 chunk 5k 行 事务提交)", shape=box, color=blue];
+    }
+
+    streamw [label="etl-worker (stream)\n微批 flush 200ms/500 条\noffset checkpoint", shape=box, color=blue];
+    dst [label="PostgreSQL+PostGIS 目标表", shape=cylinder];
+
+    // 批：orchestrator 规划分片 → 派工 → worker 进程内 E-T-L → 回报
+    orch -> s_jdbc [label="读元数据/MIN-MAX", style=dotted];
+    orch -> tp_disp [label="produce 每 shard"];
+    tp_disp -> reader [label="consume(key=taskId, 但分片间可并行)"];
+    reader -> xform [label="in-process"];
+    xform -> sink [label="in-process"];
+    s_jdbc -> reader;
+    s_mongo -> reader;
+    s_file -> reader;
+    sink -> dst [label="batchUpsert"];
+    sink -> ckpt;
+    ckpt -> tp_prog [label="poller 投递进度", style=dotted];
+    ckpt -> tp_res [label="run 终态", style=dotted];
+    ckpt -> tp_dlt [label="永久错误/毒 shard", style=dotted];
+    tp_prog -> orch [label="consume", style=dotted];
+    tp_res  -> orch [label="consume→状态机", style=dotted];
+    tp_dlt  -> orch [label="consume→NEEDS_ATTENTION", style=dotted];
+    tp_cmd  -> reader [label="cancel/pause 生效", style=dotted];
+
+    // 流：源 topic 直连 stream worker → sink
+    s_iot -> tp_src [label="外部 produce"];
+    tp_src -> streamw [label="consume"];
+    streamw -> dst [label="微批 sink + offset checkpoint"];
+    streamw -> tp_res [label="心跳/指标 60s", style=dotted];
+
+    // 背压标注
+    reader -> sink [label="Semaphore(activeShards=cpu*2)\npause() partition 背压", style=dotted, color=orange];
+}

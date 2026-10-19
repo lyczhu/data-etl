@@ -1,0 +1,59 @@
+// data-etl 目标任务全生命周期状态机（target-state）
+// 权威定义：docs/architecture/orchestrator-design.md §5.1 迁移全表（T1–T32，32 条合法边）
+// 本图已按 orchestrator-design.md §8.2 的差异清单同步（原 evolution-plan §3.2 的 9 处边修订）
+// 与 AllowedTransitions 逐边对齐：共 32 条合法迁移边（含 T27 的 CREATED→CANCELLED，早期版本曾漏该边）
+// 迁移集中在 OrchestratorService.transition(runId, from, to, ctx)；禁止散点 setStatus(...)
+// 渲染：dot -Tsvg target-lifecycle-states.dot -o target-lifecycle-states.svg
+// 终态(双圈): SUCCEEDED/FAILED/CANCELLED/SUPERSEDED；NEEDS_ATTENTION 仅经 /retry /resume /abort 迁出
+digraph "etl-lifecycle" {
+    rankdir=TB;
+    fontname="Microsoft YaHei";
+    node [fontname="Microsoft YaHei", fontsize=10];
+    edge [fontname="Microsoft YaHei", fontsize=9];
+
+    CREATED     [label="CREATED\n提交入库(建 run, attempt=1)", shape=circle];
+    VALIDATED   [label="VALIDATED\n校验通过", shape=circle];
+    QUEUED      [label="QUEUED\n入队待派\n(queued_reason=SCHEDULED|THROTTLED)", shape=circle];
+    DISPATCHED  [label="DISPATCHED\n已发 dispatch.batch\n(尚无 worker 心跳)", shape=circle];
+    RUNNING     [label="RUNNING\nworker 首次心跳", shape=circle];
+    PARTIAL     [label="PARTIAL_SUCCESS\n部分 shard 失败", shape=circle];
+    RETRYING    [label="RETRYING\nattempt+1 退避(quiesce)", shape=circle];
+    NEEDS_ATT   [label="NEEDS_ATTENTION\nattempt耗尽/DLT/卡死/饥饿/人工暂停", shape=circle, color=red, fontcolor=red];
+    SUCCEEDED   [label="SUCCEEDED", shape=doublecircle];
+    FAILED      [label="FAILED", shape=doublecircle];
+    CANCELLED   [label="CANCELLED", shape=doublecircle];
+    SUPERSEDED  [label="SUPERSEDED\n(仅 run 层归档态)", shape=doublecircle];
+
+    CREATED   -> VALIDATED  [label="T2/T31 validate()"];
+    CREATED   -> FAILED     [label="T3 invalid(FATAL_CONFIG)"];
+    CREATED   -> CANCELLED  [label="T27 cancel(未派工直接终态)"];
+    VALIDATED -> QUEUED     [label="T4 enqueue()"];
+    VALIDATED -> FAILED     [label="T30 ENQUEUE_STALLED", style=dashed];
+    VALIDATED -> CANCELLED  [label="T27 cancel"];
+    QUEUED    -> DISPATCHED [label="T5 dispatch(取得令牌)"];
+    QUEUED    -> CANCELLED  [label="T27 cancel"];
+    QUEUED    -> NEEDS_ATT  [label="T32 DISPATCH_STARVED", style=dashed];
+    DISPATCHED-> RUNNING    [label="T7 worker heartbeat"];
+    DISPATCHED-> QUEUED     [label="T8 60s 无心跳 ∧ quiesce → attempt+1", style=dashed];
+    DISPATCHED-> NEEDS_ATT  [label="T9 无心跳 ∧ attempt 耗尽"];
+    DISPATCHED-> CANCELLED  [label="T27 cancel via commands"];
+    RUNNING   -> SUCCEEDED  [label="T10 G-4: 全 shard SUCCEEDED ∧ rowsOut+rowsDropped=rowsIn"];
+    RUNNING   -> PARTIAL    [label="T11 G-2: some shards FAILED"];
+    RUNNING   -> RETRYING   [label="T12 PERSISTENT ∧ attemptsLeft ∧ quiesce"];
+    RUNNING   -> NEEDS_ATT  [label="T13 FATAL/DLT 非空/STALLED"];
+    RUNNING   -> FAILED     [label="T14 run 级 fatal ∧ DLT 为空"];
+    RUNNING   -> CANCELLED  [label="T15/T16 cancel(chunk 边界落 checkpoint)"];
+    PARTIAL   -> RETRYING   [label="T17 attemptsLeft>0 仅重跑失败分片"];
+    PARTIAL   -> NEEDS_ATT  [label="T18 attempts 耗尽/驻留>24h"];
+    PARTIAL   -> SUCCEEDED  [label="T19 /mark-succeeded-with-data-loss", color=purple];
+    PARTIAL   -> CANCELLED  [label="T20 /cancel 保留已提交数据"];
+    RETRYING  -> DISPATCHED [label="T21 退避到期\n从 checkpoint 续跑"];
+    RETRYING  -> NEEDS_ATT  [label="T22 新 attempt 立即 FATAL"];
+    RETRYING  -> CANCELLED  [label="T23 cancel(退避窗口内)"];
+    NEEDS_ATT -> QUEUED     [label="T24 POST /retry", color=blue];
+    NEEDS_ATT -> RUNNING    [label="T25 POST /resume", color=blue, style=dashed];
+    NEEDS_ATT -> FAILED     [label="T26 POST /abort", color=blue];
+    SUCCEEDED -> SUPERSEDED [label="T28 新 run 归档", style=dashed];
+    FAILED    -> SUPERSEDED [label="T29 新 run 归档", style=dashed];
+    CANCELLED -> SUPERSEDED [label="T29 新 run 归档", style=dashed];
+}

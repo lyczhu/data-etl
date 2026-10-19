@@ -1,0 +1,65 @@
+// data-etl 目标态容器图（target-state, L2）— 由 evolution-planner 产出
+// 配套：etl-architecture-evolution-plan.md §2
+// 渲染：dot -Tsvg target-container-view.dot -o target-container-view.svg
+// 图例：实线=同步/HTTP；点线=异步(Kafka)/配置拉取；[target]=新增/改造节点
+digraph "target-containers" {
+    rankdir=TB;
+    fontname="Microsoft YaHei";
+    node [fontname="Microsoft YaHei", fontsize=11];
+    edge [fontname="Microsoft YaHei", fontsize=9];
+
+    actor [label="运维/使用者\n(curl · test-scripts · 前端)", shape=oval, style=dashed];
+
+    subgraph cluster_plat {
+        label="平台服务 (保留)"; style=dashed;
+        registry  [label="registry Eureka :8761", shape=box];
+        configsvr [label="config-server :8050", shape=box];
+        gateway   [label="gateway :8080\n+trace propagation", shape=box];
+        user_svc  [label="user-service :8086\nJWT/RBAC", shape=box];
+        dsm       [label="data-source-service :8081\n[target] 元数据 CRUD\nconnectorType/connectionSchema\n凭据不入消息(改传id)", shape=box];
+    }
+
+    subgraph cluster_etl {
+        label="ETL 核心 (合并/升级)"; style=dashed;
+        orch [label="etl-orchestrator :8082\n[target] 原 task-management\n状态机 + etl_task_run/checkpoint/dlt/audit\nsubmit/cancel/retry/resume", shape=box, color=blue];
+        worker [label="etl-worker (同 jar 多实例)\n[target] profile=batch\n进程内 SourceReader→Transformer→Sink\nchunk/checkpoint/outbox", shape=box, color=blue];
+        stream [label="etl-worker profile=stream\n[target] stream-runtime\nIoT/CDC/文件 常驻消费", shape=box, color=blue];
+        spi [label="connector-spi (jar)\n[target] JDBC/Mongo/File/IoT\nGeoTools+PostGIS 空间", shape=box, color=blue];
+    }
+
+    subgraph cluster_infra {
+        label="基础设施"; style=dashed;
+        pg [label="PostgreSQL+PostGIS :5433\netl_system + 运行/checkpoint/dlt 表\n+ pg_stat_statements", shape=cylinder];
+        redis [label="Redis :6379\n锁 + 热点缓存(非完成判定真源)", shape=cylinder];
+        kafka [label="Kafka\ncommands/dispatch/progress/results/dlt\nsource.iot.raw / source.file.arrival", shape=cylinder];
+        apm [label="[target] OTel→Tempo/Jaeger\nPrometheus/Grafana/Alertmanager", shape=box, color=blue];
+    }
+
+    src [label="异构源\nMySQL/PG/Mongo/文件(JSON/CSV/GeoJSON)/IoT", shape=cylinder];
+
+    actor -> gateway;
+    gateway -> orch;
+    gateway -> dsm;
+    gateway -> user_svc;
+    gateway -> registry [style=dotted];
+
+    orch -> dsm [label="取连接(按id,现取现用)"];
+    orch -> pg [label="JPA 读写 状态/checkpoint"];
+    orch -> redis [label="RLock"];
+    orch -> kafka [label="produce dispatch/commands", style=dotted];
+    kafka -> worker [label="consume dispatch.batch", style=dotted];
+    worker -> spi [label="in-process"];
+    worker -> src [label="读源(分片)"];
+    worker -> pg [label="真批/COPY + upsert 幂等"];
+    worker -> kafka [label="produce progress/results/dlt", style=dotted];
+    kafka -> orch [label="consume progress/results/dlt", style=dotted];
+    stream -> kafka [label="consume source.iot/file", style=dotted];
+    stream -> spi;
+    stream -> pg [label="微批 sink + offset checkpoint"];
+    stream -> kafka [label="heartbeat→results", style=dotted];
+
+    {configsvr} -> orch [label="spring.config.import", style=dotted];
+    configsvr -> worker [style=dotted];
+    {orch worker stream} -> apm [label="trace/metric/log", style=dotted];
+    worker -> redis [label="去重预筛(DB兜底)", style=dotted];
+}
