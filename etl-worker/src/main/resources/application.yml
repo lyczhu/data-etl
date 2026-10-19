@@ -1,0 +1,66 @@
+spring:
+  application:
+    name: etl-worker
+  config:
+    import: optional:configserver:http://localhost:8050
+  profiles:
+    active: batch          # batch=分片批处理；stream=常驻流消费（Phase 3）
+  datasource:
+    url: jdbc:postgresql://localhost:5433/etl_system
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: etl-worker
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        linger.ms: 10
+        batch.size: 262144
+        compression.type: zstd
+
+server:
+  port: 8086
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+etl:
+  topics:
+    dispatch-batch: etl.task.dispatch.batch
+    progress: etl.task.progress
+    results: etl.task.results
+    dlt: etl.task.dlt
+  worker:
+    chunk-size: 5000
+    fetch-size: 5000
+    max-shards: 5000
+    progress-interval-ms: 5000
+    transform-profile: JDBC   # JDBC|CSV|JSON|MONGO|GEOJSON；决定默认转换规则链
+    number-scale: 2
+    keep-columns: []          # 非空则前置字段裁剪 + snake_case 归一
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,refresh
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}

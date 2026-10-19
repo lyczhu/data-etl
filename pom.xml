@@ -115,6 +115,8 @@
         <module>data-extraction-service</module>
         <module>data-transformation-service</module>
         <module>data-storage-service</module>
+        <module>etl-connector-spi</module>
+        <module>etl-worker</module>
         <module>user-service</module>
     </modules>
 
