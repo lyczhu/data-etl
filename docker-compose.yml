@@ -42,6 +42,15 @@ services:
   postgres:
     image: postgis/postgis:17-3.6-alpine
     container_name: postgres
+    # Phase 0 可观测性：开启慢查询日志与 pg_stat_statements
+    command:
+      - postgres
+      - -c
+      - log_min_duration_statement=100
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -115,8 +124,13 @@ services:
   alertmanager:
     image: prom/alertmanager:v0.30.1
     container_name: alertmanager
+    # Alertmanager 默认监听容器内 9093；宿主暴露为 9095（9095:9093），容器间寻址走 alertmanager:9093
+    command:
+      - --config.file=/etc/alertmanager/config.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=:9093
     ports:
-      - "9095:9095"
+      - "9095:9093"
     volumes:
       - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/config.yml:ro
     networks:

@@ -38,3 +38,52 @@ groups:
         annotations:
           summary: "High disk usage on {{ $labels.instance }}"
           description: "Disk usage > 85% for more than 5 minutes on {{ $labels.instance }}"
+
+  # Phase 0 可观测性：仅对当前已真实产出的指标告警（storage etl.* 埋点 + JVM + Kafka lag）。
+  # NEEDS_ATTENTION / DLT 类规则依赖 Phase 1 的 orchestrator 指标，届时再启用。
+  - name: etl-pipeline-alerts
+    rules:
+      - alert: JvmFullGcStorm
+        expr: rate(jvm_gc_pause_seconds_count{action="end of major GC"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Full GC storm on {{ $labels.application }}/{{ $labels.instance }}"
+          description: "Major (>Full) GC rate > 0.1/s for 5m; 疑似堆不足或内存泄漏（见 performance-analysis.md §2）。"
+
+      - alert: EtlLoadSlowRegression
+        expr: histogram_quantile(0.95, sum(rate(etl_load_duration_seconds_bucket[5m])) by (le)) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ETL load P95 latency regression"
+          description: "单批次入库 P95 耗时 > 5s 持续 10m。"
+
+      - alert: EtlRecordsDroppedGrowing
+        expr: increase(etl_records_dropped_total[10m]) > 20
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ETL dropping many malformed records"
+          description: "10m 内因消息非法被丢弃 > 20 条；需排查上游数据/契约（Phase 1 将转 DLT）。"
+
+      - alert: EtlInsertRetryHigh
+        expr: increase(etl_insert_retry_total[5m]) > 30
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ETL insert retries elevated"
+          description: "5m 内批量插入重试 > 30 次；目标库可能过载或存在约束冲突。"
+
+      - alert: EtlConsumerLagHigh
+        expr: kafka_consumer_fetch_manager_records_lag_max{client_id=~".*"} > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag high on {{ $labels.client_id }}"
+          description: "消费 lag > 5000 持续 10m；存在背压/吞吐瓶颈。"

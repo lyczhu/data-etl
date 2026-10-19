@@ -42,7 +42,8 @@ out/
 
 # Logs
 *.log
-logs/
+logs/*
+e2e-logs/*
 
 # OS
 .DS_Store

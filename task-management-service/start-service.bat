@@ -7,8 +7,8 @@ cd /d "%~dp0"
 
 :: 默认配置值
 set "SERVICE_NAME=task-management-service"
-set "JAVA_HEAP_MIN=512m"
-set "JAVA_HEAP_MAX=512m"
+set "JAVA_HEAP_MIN=1024m"
+set "JAVA_HEAP_MAX=1024m"
 set "JAVA_METASPACE_MIN=128m"
 set "JAVA_METASPACE_MAX=256m"
 set "JAVA_GC_TYPE=G1GC"

@@ -29,7 +29,9 @@ spring:
     producer:
       properties:
         linger.ms: 10
-        batch.size: 262,144   # 256KB
+        # 修复：原值 262,144 含千分位逗号，被 YAML 当字符串传给 Kafka batch.size(INT) →
+        # 抛 ConfigException，转换服务每次发送失败，E→L 断链、任务永不完成。
+        batch.size: 262144   # 256KB
 
 eureka:
   client:

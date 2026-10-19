@@ -19,7 +19,7 @@ spring:
   redis:
     host: localhost
     port: 6379
-    password:
+    # 本地/编排 Redis 未设 requirepass；空 password 会被 Redisson 当作 AUTH 口令导致启动失败，故不定义该属性
   kafka:
     bootstrap-servers: localhost:9092
     properties:

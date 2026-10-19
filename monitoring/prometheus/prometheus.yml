@@ -25,4 +25,4 @@ rule_files:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ['alertmanager:9095']
+        - targets: ['alertmanager:9093']

@@ -40,6 +40,8 @@ public class KafkaConfig {
         ConcurrentKafkaListenerContainerFactory<String, String> factory = 
             new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory());
+        // Phase 0 真批入库：开启 batch listener，整批记录交给监听器聚合成一次 executeBatch
+        factory.setBatchListener(true);
         return factory;
     }
 }

@@ -7,6 +7,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
+
 @Component
 public class TransformedDataListener {
     private static final Logger log = LoggerFactory.getLogger(TransformedDataListener.class);
@@ -14,15 +16,18 @@ public class TransformedDataListener {
     @Autowired
     private DataStorageService dataStorageService;
 
+    /**
+     * 批消费（Phase 0：真批入库）：整批一次交付给 storeBatch 聚合入库。
+     */
     @KafkaListener(topics = "${etl.topics.data-transformation}", groupId = "${spring.kafka.consumer.group-id}")
-    public void listen(String transformedData) {
+    public void listen(List<String> transformedDataBatch) {
         try {
-            dataStorageService.storeData(transformedData);
+            dataStorageService.storeBatch(transformedDataBatch);
         } catch (Exception e) {
-            // 修复：原实现吞掉异常会导致位点提交、消息丢失；抛出后由 Kafka 错误处理器重试
-            // （DataStorageService 已基于 taskId+id 做幂等去重，重试不会重复入库）
-            log.error("Error processing transformed data, will retry: {}", e.getMessage());
-            throw new RuntimeException("Failed to store transformed data", e);
+            // 抛出让 Kafka 重投整批；已提交行的去重标记避免重复入库
+            log.error("Error processing transformed data batch ({} msgs), will retry: {}",
+                    transformedDataBatch == null ? 0 : transformedDataBatch.size(), e.getMessage());
+            throw new RuntimeException("Failed to store transformed data batch", e);
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.lawyus.dataetl.datatransformation.config;
 
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
@@ -9,7 +10,10 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Configuration
 public class ThreadPoolConfig {
 
-    public Executor etlTransformerExecutor() {
+    // 修复：原方法缺少 @Bean 注解且 bean 名(etlTransformerExecutor)与 RawDataListener 的
+    // @Qualifier("etlTransformExecutor") 不一致，导致 NoSuchBeanDefinition、转换服务无法启动。
+    @Bean("etlTransformExecutor")
+    public Executor etlTransformExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         int processors = Runtime.getRuntime().availableProcessors();
         executor.setCorePoolSize(processors);
