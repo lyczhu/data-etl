@@ -292,9 +292,9 @@ POST /api/tasks
 - [x] **WP-16 迁移能力**：白名单 `etl.routing.data-source-whitelist` + `isNewWorkerFor` 已在 Phase 1A 落地；新增 `ShadowCompareService`（旧 `completed_records` vs 新 `rows_out`，仅 shadow-compare=true 且旧计数>0）；回滚 runbook 见 `docs/architecture/e2e-runbook.md`。真实回滚演练未执行（需环境）。
 - [x] **WP-17 源端一致性**：分片计划冻结 `pkTo`（主键高水位），run 期间新行不进入本次 run；`SourceSpec.queryTimeoutSeconds` + MySQL `Integer.MIN_VALUE` 流式 fetch；`WorkerProperties.query-timeout-seconds` 默认 600s。证据：`SourceSnapshotIT`。源端取消仍靠 lease/超时，未做服务端 cancel 协议。
 - [x] **WP-18 契约与文档**：`KafkaContractTest` 锁 dispatch/results/progress/dlt 字段与“派工不含连接/口令”；`orchestrator-design.md`、`connector-spi.md`、`AGENTS.md` 同步 lease/DB 许可/V-3 约束。
-- [ ] **Gate 2 环境型证据**：告警实际触发、真实回滚演练、2 个独立 orchestrator JVM（当前用两个 `TokenBucket` 实例 + 同库验证）、真实进程级 lease 抢占仍待环境。
+- [x] **Gate 2 环境型证据（2026-10-19）**：两个独立 task-management JVM（8082/8092，共享 DB）在 `max-concurrent-shards=4` 下稳定保持 4 个 ASSIGNED，Kafka 每 shard 恰好 1 条派工消息；杀掉一个实例后另一个继续补派。两个独立 worker 进程（不同消费组）验证了 lease 互斥、接管与旧 owner 迟到写入被拒。Prometheus/Alertmanager 实际触发 `EtlCheckpointLagHigh`、`EtlRunNeedsAttention`、`EtlDltUnresolved`，webhook 收到投递。回滚演练（`new-worker=false` + `/abort` T26）后无孤儿 run、无重复写入，并用旧链路完成任务 `2883cdda...`（100 行）验证接管。环境验证发现并修复 `globalMaxUpdatedAt` 未限定活跃 run 导致空闲误报 lag 的缺陷，新增 `CheckpointLagMetricIT`。证据：`e2e-logs/phase1b-gate2-evidence.md`。
 
-> 结论：Phase 1B 的代码与本地可执行验收已收口（`mvn test` 141 例、`-Pit` 50 例，0 failures/0 skipped）；环境型 Gate 2 证据未完成前，`etl.routing.new-worker` 继续默认 `false`。
+> 结论：Phase 1B 的代码与 Gate 1/2 本地证据已收口（`mvn test` 141 例、`-Pit` 51 例，0 failures/0 skipped）；`etl.routing.new-worker` 默认仍为 `false`，Phase 1C 按 `data-source-whitelist` 逐个 dataSource 开启。
 
 ### Phase 1C · 灰度（4 周：1 个 dataSource 观察 7 天 + 3 个放量阶段各 1 周）
 

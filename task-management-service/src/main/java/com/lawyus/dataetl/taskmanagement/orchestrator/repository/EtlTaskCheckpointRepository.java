@@ -61,8 +61,14 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
     @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c WHERE c.runId = :runId")
     Date maxUpdatedAt(@Param("runId") String runId);
 
-    /** WP-15：全局 checkpoint 最近写入时间（etl.checkpoint.lag.seconds 的数据源）。 */
-    @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c")
+    /**
+     * WP-15：全局 checkpoint 最近写入时间（{@code etl.checkpoint.lag.seconds} 的数据源）。
+     *
+     * <p>只统计仍在推进的 run（{@code DISPATCHED/RUNNING}）：终态或等待人工处置的 run 不再更新
+     * checkpoint，若把它们的旧行算进来，系统空闲时 lag 会无限增长并误报 {@code EtlCheckpointLagHigh}。
+     */
+    @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c, EtlTaskRun r "
+            + "WHERE c.runId = r.runId AND r.status IN ('DISPATCHED', 'RUNNING')")
     Date globalMaxUpdatedAt();
 
     /**
