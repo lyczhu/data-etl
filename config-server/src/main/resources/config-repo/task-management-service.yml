@@ -50,6 +50,31 @@ etl:
     task-request: task-request
     task-completed: task-completed
     task-failed: task-failed
+    # 目标态新 topic（控制面，§5.1）；DispatchService / Progress·Results·Dlt 监听在 Worker/SPI 接线切片接入
+    dispatch-batch: etl.task.dispatch.batch
+    progress: etl.task.progress
+    results: etl.task.results
+    dlt: etl.task.dlt
+    commands: etl.task.commands
+  # 编排器状态机退避/超时阈值（orchestrator-design.md §7.8）；被四个 sweeper 读取
+  orchestrator:
+    max-attempts: 3
+    dispatch-heartbeat-timeout: 60s
+    cancel-ack-timeout: 90s
+    scheduled-starvation-timeout: 5m
+    throttled-starvation-timeout: 30m
+    partial-success-retention: 24h
+    needs-attention-escalation: 7d
+    created-timeout: 5s
+    validated-timeout: 10s
+    stall-fallback-threshold: 30m
+    backoff-task-attempts: [5m, 15m, 1h]
+  # 派工与背压（§5.4 / §7.2）；令牌桶容量 = max-concurrent-shards
+  dispatch:
+    pump-batch: 50
+    permits-per-run: 8
+    max-concurrent-shards: 24
+    shard-max-total: 5000
 
 management:
   endpoints:

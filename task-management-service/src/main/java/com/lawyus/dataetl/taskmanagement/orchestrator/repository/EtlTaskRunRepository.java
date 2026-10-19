@@ -81,4 +81,36 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskRun r SET r.isCurrent = FALSE WHERE r.runId = :runId")
     int clearCurrent(@Param("runId") String runId);
+
+    // --- sweeper 候选查询（§6.5 / §7.9，均限 is_current 的非终态 run）---
+
+    /** DISPATCHED 且派工基线早于 cutoff（DispatchTimeoutSweeper，T8/T9）。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'DISPATCHED' "
+            + "AND r.dispatchedAt IS NOT NULL AND r.dispatchedAt < :cutoff")
+    List<EtlTaskRun> findDispatchedTimedOut(@Param("cutoff") Date cutoff);
+
+    /** RETRYING 且退避已到期（BackoffReleaseSweeper，T21）。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'RETRYING' "
+            + "AND r.nextAttemptAt IS NOT NULL AND r.nextAttemptAt <= :now")
+    List<EtlTaskRun> findRetryingDue(@Param("now") Date now);
+
+    /** QUEUED 且驻留早于 cutoff（饥饿判定，T32；以 updated_at 作为入队时间代理）。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'QUEUED' "
+            + "AND r.updatedAt < :cutoff")
+    List<EtlTaskRun> findQueuedOlderThan(@Param("cutoff") Date cutoff);
+
+    /** VALIDATED 且驻留早于 cutoff（内部错误，T30）。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'VALIDATED' "
+            + "AND r.updatedAt < :cutoff")
+    List<EtlTaskRun> findValidatedStuck(@Param("cutoff") Date cutoff);
+
+    /** RUNNING 且最近心跳早于 cutoff（卡死候选，T13；最终由 SweeperPolicy 叠 checkpoint 活动精判）。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'RUNNING' "
+            + "AND (r.lastProgressTs IS NULL OR r.lastProgressTs < :cutoff)")
+    List<EtlTaskRun> findRunningStalledCandidates(@Param("cutoff") Date cutoff);
+
+    /** RUNNING 且取消请求早于 cutoff（ack 兜底候选，T16；须再叠 quiesce）。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'RUNNING' "
+            + "AND r.cancelRequestedAt IS NOT NULL AND r.cancelRequestedAt < :cutoff")
+    List<EtlTaskRun> findCancelTimedOutCandidates(@Param("cutoff") Date cutoff);
 }

@@ -1,8 +1,10 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator;
 
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
+import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.event.DomainEventPublisher;
 import com.lawyus.dataetl.taskmanagement.orchestrator.event.EtlTaskTransitioned;
+import com.lawyus.dataetl.taskmanagement.orchestrator.policy.BackoffSchedule;
 import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskRunRepository;
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.slf4j.Logger;
@@ -50,17 +52,20 @@ public class OrchestratorService implements OrchestratorEngine {
     private final GuardChain guardChain;
     private final OrchestratorMetrics metrics;
     private final DomainEventPublisher eventPublisher;
+    private final OrchestratorProperties properties;
 
     public OrchestratorService(EtlTaskRunRepository runRepository,
                                EtlTaskRepository taskRepository,
                                GuardChain guardChain,
                                OrchestratorMetrics metrics,
-                               DomainEventPublisher eventPublisher) {
+                               DomainEventPublisher eventPublisher,
+                               OrchestratorProperties properties) {
         this.runRepository = runRepository;
         this.taskRepository = taskRepository;
         this.guardChain = guardChain;
         this.metrics = metrics;
         this.eventPublisher = eventPublisher;
+        this.properties = properties;
     }
 
     /**
@@ -194,17 +199,9 @@ public class OrchestratorService implements OrchestratorEngine {
         return ec + from + "->" + to + ": " + (ctx.reason() == null ? "" : ctx.reason());
     }
 
-    /** 退避：attempt 1→5m、2→15m、≥3→1h（§7.4 / §12.1 时间推进用可注入 now 判定）。 */
+    /** 退避：从集中配置 {@code etl.orchestrator.backoff-task-attempts} 取档（§7.8，代码不写死）。 */
     private Date nextAttemptAt(Date now, int attemptNo) {
-        long millis;
-        if (attemptNo <= 1) {
-            millis = 5 * 60_000L;
-        } else if (attemptNo == 2) {
-            millis = 15 * 60_000L;
-        } else {
-            millis = 60 * 60_000L;
-        }
-        return new Date(now.getTime() + millis);
+        return BackoffSchedule.nextAttemptAt(properties.getBackoffTaskAttempts(), attemptNo, now);
     }
 
     /** 便捷读侧方法，供上层/测试查询当前 run。 */

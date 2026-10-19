@@ -66,9 +66,9 @@ public class EtlTaskService {
         task.setDataSourceId(taskDetails.getDataSourceId());
         task.setSourceTableName(taskDetails.getSourceTableName());
         task.setTargetTableName(taskDetails.getTargetTableName());
-        task.setStatus(taskDetails.getStatus());
-        task.setTotalRecords(taskDetails.getTotalRecords());
-        task.setCompletedRecords(taskDetails.getCompletedRecords());
+        // 封堵绕过状态机的口子（orchestrator-design.md §9）：status 与派生计数
+        // （totalRecords/completedRecords）从可更新集合中移除，仅允许改非状态字段。
+        // status 的唯一写路径是 OrchestratorService.transition()；计数由 checkpoint 投影。
         task.setDescription(taskDetails.getDescription());
 
         return etlTaskRepository.save(task);

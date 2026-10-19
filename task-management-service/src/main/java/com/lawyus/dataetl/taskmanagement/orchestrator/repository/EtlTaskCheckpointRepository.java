@@ -46,6 +46,10 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
             + "WHERE c.runId = :runId AND c.status IN ('ASSIGNED','RUNNING')")
     long countActiveShards(@Param("runId") String runId);
 
+    /** 卡死判定（§7.9）：本 run 分片最近一次写入时间（无分片时为 null）。 */
+    @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c WHERE c.runId = :runId")
+    Date maxUpdatedAt(@Param("runId") String runId);
+
     /** progress 心跳仅刷新 updated_at，不改 shard 状态（§7.3）。 */
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskCheckpoint c SET c.updatedAt = :ts "
