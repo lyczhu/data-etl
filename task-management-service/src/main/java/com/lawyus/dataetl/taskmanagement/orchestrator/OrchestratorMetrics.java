@@ -42,6 +42,30 @@ public class OrchestratorMetrics {
                 .increment();
     }
 
+    /** 派工 pump：成功发出一片派工消息（§7.2，低基数，无标签）。 */
+    public void dispatchShardPublished() {
+        named("etl.dispatch.shard.published.total").increment();
+    }
+
+    /** 派工 pump：因令牌不足把 run 标 THROTTLED（T6）。 */
+    public void dispatchThrottled() {
+        named("etl.dispatch.throttled.total").increment();
+    }
+
+    /** 协议违例（如 RETRYING 窗口内收到活跃心跳，INV-5）。 */
+    public void protocolViolation() {
+        named("etl.protocol.violation.total").increment();
+    }
+
+    /** 消费到 DLT 行（触发 NEEDS_ATTENTION，§7.6）。 */
+    public void dltReceived() {
+        named("etl.dlt.received.total").increment();
+    }
+
+    private Counter named(String name) {
+        return Counter.builder(name).register(registry);
+    }
+
     private Counter counter(String name, EtlTaskStatus from, EtlTaskStatus to) {
         return Counter.builder(name)
                 .tag("from", from.name())

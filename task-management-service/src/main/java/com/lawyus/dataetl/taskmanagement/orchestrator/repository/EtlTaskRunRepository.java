@@ -1,6 +1,7 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator.repository;
 
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -113,4 +114,12 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
     @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'RUNNING' "
             + "AND r.cancelRequestedAt IS NOT NULL AND r.cancelRequestedAt < :cutoff")
     List<EtlTaskRun> findCancelTimedOutCandidates(@Param("cutoff") Date cutoff);
+
+    /**
+     * 待派工的 QUEUED run（{@code DispatchService.pump} 用，§7.2）：按入队时间升序取前 {@code pageable} 个，
+     * 保证公平（先进先出）。仅取当前 run（{@code is_current=TRUE}）。
+     */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'QUEUED' "
+            + "ORDER BY r.updatedAt ASC")
+    List<EtlTaskRun> findQueuedForDispatch(Pageable pageable);
 }

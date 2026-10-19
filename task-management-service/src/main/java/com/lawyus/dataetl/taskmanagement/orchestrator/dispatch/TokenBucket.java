@@ -16,10 +16,12 @@ import java.util.concurrent.Semaphore;
 public class TokenBucket {
 
     private final Semaphore semaphore;
+    private final int capacity;
 
     public TokenBucket(DispatchProperties properties) {
         // 公平模式，容量取全局并发分片上限
-        this.semaphore = new Semaphore(Math.max(0, properties.getMaxConcurrentShards()), true);
+        this.capacity = Math.max(0, properties.getMaxConcurrentShards());
+        this.semaphore = new Semaphore(this.capacity, true);
     }
 
     /** 非阻塞申请 {@code permits} 个许可；不足则回滚申请并返回 false。 */
@@ -38,6 +40,23 @@ public class TokenBucket {
         if (permits > 0) {
             semaphore.release(permits);
         }
+    }
+
+    /**
+     * 归还许可但不超过容量：at-least-once 下同分片的重复 results/dlt 会多次触发归还，
+     * 若直接 {@code release} 会使可用数超过 {@code maxConcurrent-shards}、破掉背压上界。
+     * 此处只释放到容量上限为止（安全钳制）。返回实际归还数。
+     */
+    public int releaseWithinCapacity(int permits) {
+        if (permits <= 0) {
+            return 0;
+        }
+        int room = capacity - semaphore.availablePermits();
+        int actual = Math.min(permits, Math.max(0, room));
+        if (actual > 0) {
+            semaphore.release(actual);
+        }
+        return actual;
     }
 
     /** 当前可用许可数（观测/测试用）。 */

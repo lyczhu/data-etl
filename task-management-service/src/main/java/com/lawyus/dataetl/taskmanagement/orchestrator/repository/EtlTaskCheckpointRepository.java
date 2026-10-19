@@ -2,6 +2,7 @@ package com.lawyus.dataetl.taskmanagement.orchestrator.repository;
 
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunAggregate;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskCheckpoint;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -9,6 +10,7 @@ import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.util.Date;
+import java.util.List;
 
 /**
  * {@link EtlTaskCheckpoint} 仓储（orchestrator 侧只读聚合）。
@@ -55,4 +57,27 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
     @Query("UPDATE EtlTaskCheckpoint c SET c.updatedAt = :ts "
             + "WHERE c.runId = :runId AND c.shardId = :shardId")
     int touch(@Param("runId") String runId, @Param("shardId") String shardId, @Param("ts") Date ts);
+
+    /**
+     * 某 run 的待派工分片（PENDING），按 shardId 升序取前 {@code pageable} 个（§7.2）。
+     * {@code DispatchService.pump} 逐片派工时用。
+     */
+    @Query("SELECT c FROM EtlTaskCheckpoint c WHERE c.runId = :runId AND c.status = 'PENDING' "
+            + "ORDER BY c.shardId ASC")
+    List<EtlTaskCheckpoint> findPendingShards(@Param("runId") String runId, Pageable pageable);
+
+    /** 某 run 尚待派工的 PENDING 分片数（算申请令牌数 = min(pending, permitsPerRun)）。 */
+    @Query("SELECT COUNT(c) FROM EtlTaskCheckpoint c WHERE c.runId = :runId AND c.status = 'PENDING'")
+    long countPendingShards(@Param("runId") String runId);
+
+    /**
+     * 派工阶段 {@code PENDING → ASSIGNED}（§4.1 写权矩阵：这是编排器唯二合法的 checkpoint 写之一——
+     * 另者为 {@code /retry}/{@code /abort} 的重置）。以 {@code status='PENDING'} 作 CAS 条件，
+     * 只有真正从 PENDING 转出才返回 1，避免并发重复派工。
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE EtlTaskCheckpoint c SET c.status = 'ASSIGNED', c.updatedAt = CURRENT_TIMESTAMP "
+            + "WHERE c.taskId = :taskId AND c.runId = :runId AND c.shardId = :shardId AND c.status = 'PENDING'")
+    int markAssigned(@Param("taskId") String taskId, @Param("runId") String runId,
+                     @Param("shardId") String shardId);
 }

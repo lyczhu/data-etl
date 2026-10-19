@@ -75,6 +75,10 @@ etl:
     permits-per-run: 8
     max-concurrent-shards: 24
     shard-max-total: 5000
+  # 新旧链路灰度路由（§11.2/§11.4）；默认关闭 = 新链路(pump/Progress·Results·Dlt)休眠，旧链路行为不变
+  routing:
+    new-worker: false
+    shadow-compare: false
 
 management:
   endpoints:
