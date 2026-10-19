@@ -1,7 +1,9 @@
 package com.lawyus.dataetl.taskmanagement.it;
 
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
+import com.lawyus.dataetl.taskmanagement.orchestrator.EtlShardStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
+import com.lawyus.dataetl.taskmanagement.orchestrator.config.DispatchProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.dispatch.DispatchService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.dispatch.TokenBucket;
 import com.lawyus.dataetl.taskmanagement.service.EtlTaskService;
@@ -40,6 +42,9 @@ class EntryChainIT extends AbstractOrchestratorIT {
 
     @Autowired
     private TokenBucket tokenBucket;
+
+    @Autowired
+    private DispatchProperties dispatchProperties;
 
     @BeforeEach
     void prepareTopicsAndSleepPump() {
@@ -164,9 +169,15 @@ class EntryChainIT extends AbstractOrchestratorIT {
         String taskId = submitTask(dataSourceId, ItInfra.SOURCE_TABLE);
         String runId = currentRunId(taskId);
 
-        // 把全局令牌桶抽干：下一轮 pump 申请不到许可 → T6 标 THROTTLED（不推进状态）
-        int drained = tokenBucket.available();
-        assertThat(tokenBucket.tryAcquire(drained)).isTrue();
+        // WP-12：许可真源是 DB 全局活跃分片数。插入 capacity 个 ASSIGNED 分片把全局空位占满，
+        // 下一轮 pump 申请不到许可 → T6 标 THROTTLED（不推进状态）。
+        int capacity = dispatchProperties.getMaxConcurrentShards();
+        String blockerTask = seedTask(ItInfra.SOURCE_TABLE, "it_target_blocker");
+        String blockerRun = seedRun(blockerTask, EtlTaskStatus.RUNNING, 1, capacity);
+        for (int i = 0; i < capacity; i++) {
+            seedCheckpoint(blockerTask, blockerRun, "blocker-" + i, EtlShardStatus.ASSIGNED, 0, 0, 0);
+        }
+        assertThat(tokenBucket.available()).isZero();
         try {
             double throttledBefore = counter("etl.dispatch.throttled.total");
             dispatchService.pump();
@@ -176,7 +187,9 @@ class EntryChainIT extends AbstractOrchestratorIT {
             assertThat(shardStatuses(runId).values()).containsOnly("PENDING");
             assertThat(counter("etl.dispatch.throttled.total") - throttledBefore).isEqualTo(1.0);
         } finally {
-            tokenBucket.release(drained);
+            jdbc.update("DELETE FROM etl_task_checkpoint WHERE run_id = ?", blockerRun);
+            jdbc.update("DELETE FROM etl_task_run WHERE run_id = ?", blockerRun);
+            jdbc.update("DELETE FROM etl_task WHERE task_id = ?", blockerTask);
         }
     }
 

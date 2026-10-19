@@ -77,23 +77,25 @@ public class JdbcSourceConnector implements SourceConnector {
         }
         String sql = "SELECT MIN(" + pk + "), MAX(" + pk + "), COUNT(*) FROM " + spec.table();
         try (Connection conn = open(spec);
-             Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery(sql)) {
-            if (!rs.next() || rs.getObject(1) == null) {
-                return new ShardPlan(List.of(), 0L);   // 空表
+             Statement st = conn.createStatement()) {
+            applyQueryTimeout(st, spec);
+            try (ResultSet rs = st.executeQuery(sql)) {
+                if (!rs.next() || rs.getObject(1) == null) {
+                    return new ShardPlan(List.of(), 0L);   // 空表
+                }
+                long min = rs.getLong(1);
+                long max = rs.getLong(2);
+                long count = rs.getLong(3);
+                // 方案 v2 D4：分片数 = 并行单元（desiredShards），chunk 只做分片内事务单元
+                List<long[]> ranges = ShardRanges.splitByParallelism(
+                        min, max, params.desiredShards(), params.maxShards());
+                List<Shard> shards = new ArrayList<>(ranges.size());
+                for (int i = 0; i < ranges.size(); i++) {
+                    long[] r = ranges.get(i);
+                    shards.add(Shard.numeric("shard-" + i, r[0], r[1]));
+                }
+                return new ShardPlan(shards, count);
             }
-            long min = rs.getLong(1);
-            long max = rs.getLong(2);
-            long count = rs.getLong(3);
-            // 方案 v2 D4：分片数 = 并行单元（desiredShards），chunk 只做分片内事务单元
-            List<long[]> ranges = ShardRanges.splitByParallelism(
-                    min, max, params.desiredShards(), params.maxShards());
-            List<Shard> shards = new ArrayList<>(ranges.size());
-            for (int i = 0; i < ranges.size(); i++) {
-                long[] r = ranges.get(i);
-                shards.add(Shard.numeric("shard-" + i, r[0], r[1]));
-            }
-            return new ShardPlan(shards, count);
         } catch (SQLException e) {
             throw new RuntimeException("planShards failed for " + spec.table(), e);
         }
@@ -114,6 +116,7 @@ public class JdbcSourceConnector implements SourceConnector {
             Connection conn = open(spec);
             conn.setAutoCommit(false);
             java.sql.PreparedStatement ps = conn.prepareStatement(sql);
+            applyQueryTimeout(ps, spec);
             ps.setFetchSize(type == ConnectorType.MYSQL ? Integer.MIN_VALUE : 5000);
             ps.setLong(1, resume != null ? resume : shard.pkFrom());
             ps.setLong(2, shard.pkTo());
@@ -147,6 +150,13 @@ public class JdbcSourceConnector implements SourceConnector {
             }
         }
         return DriverManager.getConnection(spec.url(), spec.username(), spec.password());
+    }
+
+    /** WP-17：源端查询超时，避免源库锁等待/慢查询把分片永久挂住。 */
+    private static void applyQueryTimeout(Statement statement, SourceSpec spec) throws SQLException {
+        if (spec.queryTimeoutSeconds() > 0) {
+            statement.setQueryTimeout(spec.queryTimeoutSeconds());
+        }
     }
 
     private String primaryKeyOf(Connection conn, String table) throws SQLException {

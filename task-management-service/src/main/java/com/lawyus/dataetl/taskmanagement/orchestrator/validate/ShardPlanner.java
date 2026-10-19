@@ -6,6 +6,7 @@ import com.lawyus.dataetl.connector.spi.SourceConnector;
 import com.lawyus.dataetl.connector.spi.model.ShardPlan;
 import com.lawyus.dataetl.connector.spi.model.ShardParams;
 import com.lawyus.dataetl.connector.spi.model.SourceSpec;
+import com.lawyus.dataetl.connector.spi.model.TableSchema;
 import com.lawyus.dataetl.taskmanagement.client.DataSource;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.DispatchProperties;
 import org.springframework.stereotype.Component;
@@ -39,6 +40,15 @@ public class ShardPlanner {
         ShardParams params = new ShardParams(properties.getShardChunkSize(), properties.getShardMaxTotal(),
                 properties.getShardTargetCount());
         return connector.planShards(spec, params);
+    }
+
+    /** 读取源表 schema（WP-13：V-3 用它在目标库建表）。 */
+    public TableSchema readSchema(DataSource ds, String sourceTable) {
+        ConnectorType type = mapType(ds.getType());
+        SourceConnector connector = registry.sourceFor(type);
+        SourceSpec spec = new SourceSpec(type, ds.getUrl(), ds.getUsername(),
+                ds.getPassword(), ds.getDriverClassName(), sourceTable);
+        return connector.readSchema(spec);
     }
 
     /** 数据源类型 → SPI {@link ConnectorType}（Phase 1 仅 JDBC；未知回落 POSTGRES）。可见以便单测。 */

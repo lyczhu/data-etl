@@ -76,7 +76,12 @@ public class ProgressListener {
             log.warn("progress: message without runId skipped");
             return;
         }
-        handle(msg);
+        try {
+            KafkaMdc.put(msg.getTaskId(), msg.getRunId(), msg.getShardId(), null);
+            handle(msg);
+        } finally {
+            KafkaMdc.clear();
+        }
     }
 
     void handle(ProgressMessage msg) {
@@ -86,6 +91,7 @@ public class ProgressListener {
             return;
         }
         EtlTaskRun run = found.get();
+        KafkaMdc.putAttempt(run.getAttemptNo());
         EtlTaskStatus status = run.statusEnum();
         Date ts = msg.getTimestamp() > 0 ? new Date(msg.getTimestamp()) : new Date();
 

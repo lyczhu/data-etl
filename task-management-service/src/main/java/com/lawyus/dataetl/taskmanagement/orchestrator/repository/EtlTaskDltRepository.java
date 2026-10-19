@@ -19,6 +19,10 @@ public interface EtlTaskDltRepository extends JpaRepository<EtlTaskDlt, Long> {
             + "WHERE d.runId = :runId AND d.resolvedAt IS NULL AND d.abandoned = false")
     long countUnresolved(@Param("runId") String runId);
 
+    /** WP-15：全局未解决 DLT 数（etl.dlt.unresolved.size）。 */
+    @Query("SELECT COUNT(d) FROM EtlTaskDlt d WHERE d.resolvedAt IS NULL AND d.abandoned = false")
+    long countUnresolvedGlobal();
+
     /** {@code /failures} 最近 100 条（原文按需脱敏/截断）。 */
     List<EtlTaskDlt> findTop100ByRunIdOrderByIdAsc(String runId);
 }

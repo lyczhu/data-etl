@@ -10,7 +10,7 @@ etl-connector-spi
 └─ com.lawyus.dataetl.connector.spi
    ├─ ConnectorType              源/汇类型枚举
    ├─ SourceConnector           读侧 SPI：readSchema / planShards / open
-   ├─ SinkWriter                写侧 SPI：ensureTargetTable / writeBatch
+   ├─ SinkWriter                写侧 SPI：writeBatch（ensureTargetTable 仅供 V-3/迁移工具复用）
    ├─ ConnectorRegistry         类型→实现 注册表（未注册快速失败）
    ├─ CloseableIterator         可关闭游标（流式读，用完必关）
    ├─ model/                    SourceSpec / TableSchema / ColumnDef / Shard / ShardParams / ShardPlan / SourceRecord / SinkResult
@@ -35,18 +35,26 @@ public interface SinkWriter {
 ```
 
 - `Shard` 只带游标区间（JDBC：`pkFrom/pkTo` 闭区间；其它：`cursorFrom/cursorTo` + `resumeCursor`）——派工消息不带数据行（§5.2）。
+  `pkTo` 在计划生成时即为**冻结的主键高水位**：run 期间源表新增行（pk > 高水位）不进入本次 run（WP-17 快照语义）。
+- `SourceSpec` 含 `queryTimeoutSeconds`（0 = 不限制）：`planShards` 与 `open` 都按它设置语句超时；
+  `etl-worker` 由 `WorkerProperties.query-timeout-seconds`（默认 600s）传入，避免慢查询永久占用分片。
 - `SinkResult{rowsOut, rowsDropped, rowsDeduped}`：对账等式 `rowsOut + rowsFiltered + rowsFailed + rowsDeduped = rowsIn`（崩溃重放会再次读入 rowsIn，必须计入幂等命中）。
+
+> 目标表建表**不在 worker 分片路径**：V-3 由 `TargetTableManager` 在目标库 advisory lock 下一次性建表并补
+> `idempotency_key` 列 + UNIQUE 索引；`SinkWriter.ensureTargetTable` 仅为迁移/工具保留，不保证带幂等键。
 
 ## JDBC 参考实现要点
 
-- **分片**：`SELECT MIN/MAX/COUNT(pk)` → `ShardRanges.split(min,max,chunkSize,maxShards)`（纯函数、单测覆盖）产出互不重叠闭区间。
-- **读**：`WHERE pk BETWEEN ? AND ? ORDER BY pk` + `setFetchSize` 流式游标（PG 需关 autoCommit）。
-- **写**：整批 `executeBatch` 提交；整批失败降级逐行、坏行计 `rowsDropped`。幂等（`ON CONFLICT (idempotency_key) DO NOTHING` + PK）随 Phase 2 的目标表 DDL 一并强制。
+- **分片**：`SELECT MIN/MAX/COUNT(pk)` → `ShardRanges.split(min,max,chunkSize,maxShards)`（纯函数、单测覆盖）产出互不重叠闭区间；计划落库时冻结 `pkTo` 作为快照高水位。
+- **读**：`WHERE pk BETWEEN ? AND ? ORDER BY pk` + `setFetchSize` 流式游标（PG 需关 autoCommit；MySQL 用 `Integer.MIN_VALUE` 触发流式 fetch）；语句超时取 `SourceSpec.queryTimeoutSeconds`。
+- **写**：整批 `executeBatch` 提交；整批失败降级逐行、坏行计 `rowsDropped`。幂等靠目标表 `idempotency_key` 主键/唯一索引 + `ON CONFLICT (idempotency_key) DO NOTHING`，该约束由 V-3 保证。
 
 ## worker 侧用法（`etl-worker`）
 
-`ShardExecutor` 从 `etl.task.dispatch.batch` 收一个 `Shard`，进程内跑 `SourceReader → RecordTransformer → SinkWriter`，
-每 chunk 直写 `etl_task_checkpoint`（worker 是唯一写者，写权矩阵 §4.1），分片结束发 `etl.task.results`。
+`ShardExecutor` 从 `etl.task.dispatch.batch` 收一个 `Shard`，先以 `lease_owner/shard_attempt` 条件抢占该分片 checkpoint 的 lease
+（被新 attempt 接管则直接放弃，不再写入），随后进程内跑 `SourceReader → RecordTransformer → SinkWriter`，
+每 chunk 直写 `etl_task_checkpoint`（worker 是唯一写者，写权矩阵 §4.1）并续租，分片结束发 `etl.task.results`。
+worker **不调用** `ensureTargetTable`：目标表缺失/不可写由 V-3 在提交期拦截（`TARGET_UNWRITABLE`）。
 `ConnectorRegistry` 由 `ConnectorConfig` 用 worker 自身 `DataSource` 组装。
 
 ## 扩展一种新源（checklist）

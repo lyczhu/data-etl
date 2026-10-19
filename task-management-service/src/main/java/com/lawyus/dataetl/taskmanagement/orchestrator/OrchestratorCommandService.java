@@ -75,8 +75,10 @@ public class OrchestratorCommandService {
         EtlTaskRun run = requireCurrent(taskId);
         EtlTaskStatus from = run.statusEnum();
         if (from == EtlTaskStatus.NEEDS_ATTENTION) {
+            checkpointRepository.clearLeases(run.getRunId());
             transition(run, from, EtlTaskStatus.QUEUED, "MANUAL_RETRY");
         } else if (from == EtlTaskStatus.PARTIAL_SUCCESS) {
+            checkpointRepository.clearLeases(run.getRunId());
             transition(run, from, EtlTaskStatus.RETRYING, "MANUAL_RETRY");
         } else {
             throw new IllegalStateException("retry not allowed from " + from);
@@ -89,6 +91,8 @@ public class OrchestratorCommandService {
         if (run.statusEnum() != EtlTaskStatus.NEEDS_ATTENTION) {
             throw new IllegalStateException("resume only allowed from NEEDS_ATTENTION, actual=" + run.getStatus());
         }
+        // WP-11：人工接管前回收旧 lease（哨兵 owner），旧 worker 的迟到写入被 lease fencing 拒绝。
+        checkpointRepository.clearLeases(run.getRunId());
         transition(run, EtlTaskStatus.NEEDS_ATTENTION, EtlTaskStatus.RUNNING, "MANUAL_RESUME");
     }
 

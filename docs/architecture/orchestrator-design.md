@@ -55,9 +55,9 @@ etl_task              任务定义 + 最新 run 的汇总投影（只读视图�
 | 状态 | 语义 | 进入条件 | 驻留期间允许的副作用 | 终态? | SLA / 超时动作 |
 |---|---|---|---|---|---|
 | `CREATED` | run 记录已落库，任务定义快照已固化（source/target/connectorType/分片计划版本） | `submit()` 或 `POST /retry?scope=full` 创建 run | 仅写 run 行本身 | 否 | 5s。超时未进入校验 → sweeper 重放校验链（T31） |
-| `VALIDATED` | 校验通过：数据源可达、源表可读、目标表可建/已建、分片计划非空且 shard 数 ≤ 上限 | `validate()` 全部 guard 通过 | 无 | 否 | 10s。超时未 `QUEUED` → T30（`FAILED`, `ENQUEUE_STALLED`） |
+| `VALIDATED` | 校验通过：数据源可达、源表可读、目标表已治理（V-3 建表/补唯一键）、分片计划非空且 shard 数 ≤ 上限 | `validate()` 全部 guard 通过 | 无 | 否 | 10s。超时未 `QUEUED` → T30（`FAILED`, `ENQUEUE_STALLED`） |
 | `QUEUED` | 等待派工。两种成因由 `queued_reason` 区分：`SCHEDULED`（正常排队）/ `THROTTLED`（全局令牌不足，见 D-10） | `enqueue()`；或 `DISPATCHED` 心跳超时回退 | 更新 `queued_reason`、排队位次 | 否 | `SCHEDULED` 5min / `THROTTLED` 30min。超时 → T32（`NEEDS_ATTENTION`, `DISPATCH_STARVED`） |
-| `DISPATCHED` | 已发出 ≥1 条 shard 派工消息，但**尚未收到任何 worker 心跳** | `dispatch()` 成功写入首条 `etl.task.dispatch.batch` | 继续补发其余 shard（受令牌桶约束） | 否 | **60s**。→ §7.9 心跳超时回退 `QUEUED` 并 `attempt_no+1` |
+| `DISPATCHED` | 已发出 ≥1 条 shard 派工消息，但**尚未收到任何 worker 心跳** | `dispatch()` 成功写入首条 `etl.task.dispatch.batch` | 继续补发其余 shard（受全局许可约束） | 否 | **60s**。→ §7.9 心跳超时回退 `QUEUED` 并 `attempt_no+1` |
 | `RUNNING` | 至少一个 shard 有 worker 心跳确认，run 正在执行 | 首次心跳 CAS 成功 | `last_progress_ts` 单调更新；worker 写 checkpoint | 否 | 无固定上限，但受 `EtlTaskStalled`（§10.2）约束：`now - max(last_progress_ts, checkpoint.updated_at) > 15 × 估算单 shard 耗时` → `NEEDS_ATTENTION(reason=STALLED)` |
 | `PARTIAL_SUCCESS` | 收敛时存在 `FAILED` 分片且其余为 `SUCCEEDED/SKIPPED`；已提交数据保留 | 收敛算法（§7.5）判定 | 只读；等待自动重试或人工 | 否 | 24h。超时 → `NEEDS_ATTENTION(reason=PARTIAL_UNRESOLVED)` |
 | `RETRYING` | 已决定任务级重试，处于退避窗口内，**无 shard 在跑**（quiesce 已确认） | 持续性错误且 `attemptsLeft > 0`；或 `PARTIAL_SUCCESS` 且 `attemptsLeft > 0` | 更新 `next_attempt_at`、`attempt_no` | 否 | 退避时长 + 5min。退避到期由 sweeper 推 `DISPATCHED`；窗口内 worker 提前上报 shard RUNNING → 视为协议违例，落 DLT |
@@ -210,10 +210,10 @@ stateDiagram-v2
 | # | From → To | 触发者 | Guard（全部通过才允许） | 副作用（同事务） |
 |---|---|---|---|---|
 | T1 | (新) → `CREATED` | ORCH | 任务定义存在；INV-1 无同 task 非终态 run | 建 run（`attempt_no=1`,`is_current=TRUE`）；旧终态 run → `SUPERSEDED` |
-| T2 | `CREATED` → `VALIDATED` | ORCH | 数据源可达 ∧ 源表可读 ∧ 目标表可建 ∧ 分片计划 ∈ [1, `shard.maxTotal`] | `shard_total` 落库；批量 INSERT checkpoint(PENDING) |
+| T2 | `CREATED` → `VALIDATED` | ORCH | 数据源可达 ∧ 源表可读 ∧ 目标表已治理（V-3 建表/唯一键） ∧ 分片计划 ∈ [1, `shard.maxTotal`] | `shard_total` 落库；批量 INSERT checkpoint(PENDING) |
 | T3 | `CREATED` → `FAILED` | ORCH | 校验失败且 `errorClass=FATAL_CONFIG` | `error_summary`；`finished_at` |
 | T4 | `VALIDATED` → `QUEUED` | ORCH | 全局 RUNNING 分片额度已知（不要求已获取） | `queued_reason=SCHEDULED`；audit |
-| T5 | `QUEUED` → `DISPATCHED` | ORCH | 令牌桶 ≥1 许可；首条 dispatch 消息已进 outbox | `dispatched_at=now`；首个 shard `PENDING→ASSIGNED`；audit |
+| T5 | `QUEUED` → `DISPATCHED` | ORCH | 全局许可（DB 活跃分片数）≥1；首条 dispatch 消息已获 broker ack | `dispatched_at=now`；首个 shard `PENDING→ASSIGNED`；audit |
 | T6 | （非迁移）`QUEUED` 标记更新 | ORCH | 令牌不足 | 仅写 `queued_reason=THROTTLED`，**不走 `transition()`**（不入迁移表计数） |
 | T7 | `DISPATCHED` → `RUNNING` | WRK | 收到该 run 任一 shard 心跳；CAS `status=DISPATCHED` | `started_at=now`（仅首次）；`last_progress_ts` |
 | T8 | `DISPATCHED` → `QUEUED` | SWP | `now - dispatched_at > 60s` ∧ **该 run 无 `ASSIGNED/RUNNING` shard**（quiesce 检查） ∧ `attempt_no < maxAttempts` | `attempt_no+1`；`next_attempt_at=now+backoff`；shard `ASSIGNED→PENDING`；audit |
@@ -395,7 +395,7 @@ KafkaListener 捕获 IllegalStateTransitionException
 | `AcceptanceSweeper` | 30s | `CREATED` 驻留 > 5s 重放校验链；`VALIDATED` 驻留 > 10s 判内部错误 | T31/T30 |
 | `StallAndCancelSweeper` | 30s | `EtlTaskStalled` 判定 → `NEEDS_ATTENTION`；`cancel_requested_at<now-90s ∧ quiesce` → `CANCELLED` | T13/T16 |
 
-所有 sweeper 必须：走 `transition()`（不自写 SQL 改 status）、幂等（CAS）、日志带 MDC `taskId/runId`（Phase 0 已具备 traceId/spanId/taskId 格式）。
+所有 sweeper 必须：走 `transition()`（不自写 SQL 改 status）、幂等（CAS）、日志带 MDC `taskId/runId/shardId/attemptNo`（traceId/spanId/taskId 自 Phase 0 已有，Phase 1B 由 `KafkaMdc` 在 Kafka 监听器统一注入/清理）。
 
 ---
 
@@ -412,7 +412,8 @@ POST /api/tasks
   2. 同事务后（AFTER_COMMIT）异步 validate()：
        guard V-1 数据源存在且可达（Feign → data-source-service，走 Caffeine 缓存）
        guard V-2 源表可读且 connectorType 已注册（SPI 查找）
-       guard V-3 目标表可建（现状反射建表逻辑，Phase 2 起强制 PK + idempotency_key UNIQUE）
+       guard V-3 目标表已治理：TargetTableManager 在目标库 advisory lock 下按源 schema 建表，
+                 并补 idempotency_key 列 + UNIQUE 索引（存量重复键不清洗则失败 → TARGET_UNWRITABLE）
        guard V-4 分片计划可生成，shard 数 ∈ [1, etl.dispatch.shard-max-total]
      通过 → T2 → T4（QUEUED）；失败 → T3（FAILED, errorClass=FATAL_CONFIG）
 ```
@@ -424,19 +425,22 @@ POST /api/tasks
 关键决策：**派工粒度是 shard，run 状态只在首个 shard 派出时跃迁**；未派 shard 停留在 checkpoint 的 `PENDING`，不引入新状态（D-10）。
 
 ```
-DispatchService.pump()   每 5s（与 BackoffReleaseSweeper 同调度器）
-  for run in findQueued(limit=etl.dispatch.pump-batch):
-      permits = tokenBucket.tryAcquire(min(remainingShards, etl.dispatch.permits-per-run))
-      if permits == 0:  transition 标记 queued_reason=THROTTLED（T6，非状态变更）; continue
-      first = true
-      for shard in pendingShards(run, limit=permits):
-          outbox.insert("etl.task.dispatch.batch", key=taskId,
-                        {taskId, runId, attemptNo, shardId, pkFrom, pkTo, connectorType})
-          checkpoint.shard: PENDING → ASSIGNED          -- 与 outbox 插入同事务
-          if first: transition(run, QUEUED → DISPATCHED); first = false   -- T5
+DispatchService.pump()   每 5s（与 BackoffReleaseSweeper 同调度器；Redisson 锁串行本实例）
+  for run in findDispatchableRuns(limit=etl.dispatch.pump-batch):
+      dispatchOne(run)                                  -- 单 run 一个事务
+        SELECT pg_advisory_xact_lock(hashtext('etl:dispatch:permits'))
+        permits = tokenBucket.tryAcquireUpTo(min(pendingShards, etl.dispatch.permits-per-run))
+          └─ 全局许可真源 = COUNT(checkpoint.status IN (ASSIGNED,RUNNING))，不再用 JVM Semaphore
+        if permits == 0:  标记 queued_reason=THROTTLED（T6，非状态变更）; continue
+        first = true
+        for shard in pendingShards(run, limit=permits):
+            kafka.send("etl.task.dispatch.batch", key=runId:shardId,
+                       {taskId, runId, attemptNo, shardId, pkFrom, pkTo, connectorType})  -- 等 broker ack
+            checkpoint.shard: PENDING → ASSIGNED          -- CAS，与发消息同事务
+            if first: transition(run, QUEUED → DISPATCHED); first = false   -- T5
 ```
 
-派工消息体**只带游标区间不带数据行**（对齐方案 §5.2）；全局令牌桶上限 `etl.dispatch.max-concurrent-shards`（默认 `cpu*2*实例数` 量级，Phase 1 用静态配置 24），护住源库（方案 §5.4）。
+派工消息体**只带游标区间不带数据行**（对齐方案 §5.2）；全局许可上限 `etl.dispatch.max-concurrent-shards` 由 DB 活跃分片数（`ASSIGNED`+`RUNNING`）实时计算，事务级 advisory lock 串行化“计数→派工→置 ASSIGNED”，使多个 orchestrator 共享同一份许可，护住源库（方案 §5.4）。
 
 > 分片主键区间（`pkFrom/pkTo`）在 validate/T2 生成计划时由编排器持久化进 `etl_task_checkpoint.pk_from/pk_to`（§4.2），`pump` 直接读取回填派工消息，避免每次派工重连源库重算；worker 对该两列只读。
 
@@ -633,7 +637,7 @@ etl:
   dispatch:
     pump-batch: 50
     permits-per-run: 8
-    max-concurrent-shards: 24
+    max-concurrent-shards: 24           # DB 活跃分片数（ASSIGNED+RUNNING）的全局上限
     shard-max-total: 5000
 ```
 
@@ -697,7 +701,7 @@ QueuedStarvationCheck（并入 BackoffReleaseSweeper）
 | D-21 | `run_id` 用 UUID；`(task_id, attempt_no)` 走唯一索引 | 与现有 `task_id VARCHAR(64)` UUID 风格一致；避免拼接 id 的长度/排序问题 | `{taskId}-{attemptNo}` 拼接 | — |
 | D-22 | `attempt_no` = **同一 run 内**的任务级重试序号；自动重试不新建 run；仅 `scope=full`/重新 submit 新建 run | checkpoint PK 含 `run_id`（方案 §3.1），若每次重试新建 run 则必须复制全量 checkpoint（大任务昂贵） | 每次 attempt 一新 run | — |
 | D-23 | Redis 退位：`task:status:{taskId}`（现状 `DataExtractionService.java:232`）降为展示缓存 + 强制 TTL 24h | 消除无 TTL 永久驻留；完成判定不再依赖它（C1） | 直接删除（破坏旧 UI，灰度期需双读） | — |
-| D-24 | 新指标一律低基数（`{from,to}`、`{status}`），taskId 维度只进日志/DB | 与现有 `EtlMetrics` 注释里的取舍一致（基数无界不得入标签） | `etl.task.duration{taskId}` | — |
+| D-24 | 新指标一律低基数（`{from,to}`、`{state}`、`{sweeper}`），taskId 维度只进日志/DB | 与现有 `EtlMetrics` 注释里的取舍一致（基数无界不得入标签） | `etl.task.duration{taskId}` | — |
 | D-25 | 旧链路监听器（`TaskCompletedListener`/`TaskFailedListener`）改写为 `transition` 适配层，而非删除 | Phase 1 灰度期新旧并存，两个写入口必致漂移；适配层使所有写入仍收敛到 P2 | 保留旧代码不动 | — |
 
 ### 8.1 被本设计填补的缺口
@@ -768,11 +772,12 @@ QueuedStarvationCheck（并入 BackoffReleaseSweeper）
 | `etl.transition.ignored.total` | Counter | `from`,`to` | CAS 返回 0（幂等丢弃） |
 | `etl.transition.illegal.total` | Counter | `from`,`to` | `requireAllowed` 抛异常前 |
 | `etl.guard.failure.total` | Counter | `guard`（`G-2`/`G-4`/`QUIESCE`/`ATTEMPTS`/`BALANCE`） | guard 链失败处 |
-| `etl.run.state.count` | Gauge | `status`（基数 12） | 每 30s 从 `etl_task_run` group by status |
+| `etl.run.state.count` | Gauge | `state`（12 个枚举名） | 抓取时 `COUNT(*) GROUP BY status`（`RunStateMetrics`） |
 | `etl.run.duration` | Timer | — | 进入终态时用 `finished_at - started_at` 回观登记 |
 | `etl.checkpoint.lag.seconds` | Gauge | — | `now - MAX(etl_task_checkpoint.updated_at)`（活跃 run） |
 | `etl.dlt.unresolved.size` | Gauge | — | `resolved_at IS NULL AND abandoned IS FALSE` 行数 |
-| `etl.sweeper.actions.total` | Counter | `job`,`transition` | 四个 sweeper 内 |
+| `etl.sweeper.actions.total` | Counter | `sweeper` | 四个 sweeper 实际推进迁移处 |
+| `etl.shadow.compare.mismatch.total` | Counter | — | `ShadowCompareService`（WP-16，仅灰度期） |
 
 现有 `etl.records.{in,out,dropped,deduped}`、`etl.load.duration`、`etl.insert.retry` 保持不动（Phase 0 已上线），G-4 对账与 `etl_records_dropped_total` 共用同一计数口径（D-07）。
 
@@ -780,14 +785,11 @@ QueuedStarvationCheck（并入 BackoffReleaseSweeper）
 
 | 级别 | 规则 | 表达式要点 | 对应机制 |
 |---|---|---|---|
-| critical | `EtlTaskNeedsAttention` | `etl_run_state_count{status="NEEDS_ATTENTION"} > 0 for 5m` | 方案 §6.3 |
-| critical | `EtlIllegalTransition` | `increase(etl_transition_illegal_total[5m]) > 0` | P5/D-13，**协议被破坏，优先级高于业务失败** |
-| critical | `EtlDltGrowing` | `increase(etl_dlt_unresolved_size[10m]) > 20` | 方案 §6.3 |
-| warning | `EtlTaskStalled` | `etl_checkpoint_lag_seconds > 1800`（无样本时的兜底阈值） | §7.9 |
-| warning | `EtlDispatchStarved` | `increase(etl_transition_total{to="NEEDS_ATTENTION"}[30m]) > 0` 且来由为 T32；或 `etl_run_state_count{status="QUEUED"} > 0 for 30m` | §7.9（T32） |
-| warning | `EtlCancelNotAcked` | `increase(etl_sweeper_actions_total{job="StallAndCancelSweeper",transition="T16"}[10m]) > 0` | T16 强制取消发生 = worker 失联 |
-| warning | `EtlRowBalanceViolation` | `increase(etl_guard_failure_total{guard="BALANCE"}[10m]) > 0` | G-4 不平 = 数据静默丢失信号 |
-| info | `EtlTaskSlowRegression` | `histogram_quantile(0.95, etl_run_duration_bucket)` 相对 7d 基线 +50% | 方案 §6.3 |
+| page | `EtlRunNeedsAttention` | `sum(etl_run_state_count{state="NEEDS_ATTENTION"}) > 0 for 10m` | 方案 §6.3；排查 `/failures`、`/progress` |
+| page | `EtlDltUnresolved` | `max(etl_dlt_unresolved_size) > 0 for 10m` | 未解决 DLT 堆积 |
+| warning | `EtlCheckpointLagHigh` | `max(etl_checkpoint_lag_seconds) > 300 for 5m` | checkpoint 写入停滞 / lease 被占 |
+
+> `EtlIllegalTransition`、`EtlDispatchStarved`、`EtlCancelNotAcked`、`EtlRowBalanceViolation`、`EtlTaskSlowRegression` 依赖的指标已在 §10.1 产出；待 Prometheus/Alertmanager 环境校准阈值后再加入 `etl-orchestrator-alerts`。当前已落盘规则见 `monitoring/prometheus/rules/alerts.yml`。
 
 ### 10.3 日志与链路
 
@@ -922,7 +924,7 @@ SELECT task_id, COUNT(*) FROM etl_task_run
  GROUP BY task_id HAVING COUNT(*) > 1;
 ```
 
-四条 SQL 返空即为通过；任一非空 → `EtlTaskNeedsAttention` 同级告警。
+四条 SQL 返空即为通过；任一非空 → `EtlRunNeedsAttention` 同级告警。
 
 ### 12.3 对方案 §7.3 验收指标的责任划分
 

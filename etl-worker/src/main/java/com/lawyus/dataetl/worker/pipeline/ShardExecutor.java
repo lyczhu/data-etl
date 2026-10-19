@@ -32,11 +32,14 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
+import java.lang.management.ManagementFactory;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * 进程内 E→T→L 单分片执行器（方案 v2 WP-02/03/04/05/06）。
@@ -70,6 +73,8 @@ public class ShardExecutor {
     private final DataSource dataSource;
     private final TransactionTemplate transactionTemplate;
     private final DataSourceResolver dataSourceResolver;
+    /** WP-11：本 worker 进程的 lease 标识（pid@host-UUID）。 */
+    private final String leaseOwner;
 
     public ShardExecutor(ConnectorRegistry registry,
                          CheckpointWriter checkpointWriter,
@@ -91,20 +96,42 @@ public class ShardExecutor {
         this.dataSource = dataSource;
         this.transactionTemplate = transactionTemplate;
         this.dataSourceResolver = dataSourceResolver;
+        this.leaseOwner = resolveLeaseOwner(properties);
+    }
+
+    private static String resolveLeaseOwner(WorkerProperties properties) {
+        String configured = properties.getLeaseOwner();
+        if (configured != null && !configured.isBlank()) {
+            return configured;
+        }
+        // pid@host + 随机后缀：同一进程重启后也不会误认领旧 lease
+        return ManagementFactory.getRuntimeMXBean().getName() + "-"
+                + UUID.randomUUID().toString().substring(0, 8);
     }
 
     public SinkResult execute(ShardDispatch d) {
+        int attempt = Math.max(1, d.getAttemptNo());
+        // WP-11 lease/fencing：同一分片同一时刻只允许一个 worker 执行。lease 过期后可被接管；
+        // 未拿到 lease 的重复投递直接 ack 跳过，由持锁 worker 完成并回报。
+        int acquired = checkpointWriter.tryAcquireLease(
+                d.getTaskId(), d.getRunId(), d.getShardId(), attempt, leaseOwner, properties.getLeaseSeconds());
+        if (acquired == 0) {
+            log.warn("shard {} lease not acquired run={} attempt={} owner={}",
+                    d.getShardId(), d.getRunId(), attempt, leaseOwner);
+            return SinkResult.zero();
+        }
+
         ConnectorType type = d.connectorTypeEnum();
         SourceConnector source = registry.sourceFor(type);
         ResolvedDataSource sourceDs = dataSourceResolver.resolve(d.getDataSourceId());
-        SourceSpec sourceSpec = sourceDs.toSourceSpec(type, d.getSourceTable());
+        SourceSpec sourceSpec = sourceDs.toSourceSpec(type, d.getSourceTable(),
+                properties.getQueryTimeoutSeconds());
         SinkWriter sink = sinkFor(d, type);
 
         TableSchema srcSchema = source.readSchema(sourceSpec);
         TableSchema tgtSchema = targetSchema(d, srcSchema);
-        sink.ensureTargetTable(tgtSchema, new SourceSpec(type, null, null, null, null, d.getTargetTable()));
+        // WP-13：目标表已由 orchestrator V-3 在提交时一次性建好/校验，worker 不再每分片建表。
 
-        int attempt = Math.max(1, d.getAttemptNo());
         int retries = 0;
         while (true) {
             ShardCheckpointState state = checkpointReader.load(d.getTaskId(), d.getRunId(), d.getShardId());
@@ -183,7 +210,7 @@ public class ShardExecutor {
                         c.lastCursor = resumeBeforeFailure(r, c.lastCursor);
                         return;
                     }
-                    lastProgressAt = maybeReportProgress(d, c, lastProgressAt);
+                    lastProgressAt = maybeReportProgress(d, c, lastProgressAt, attempt);
                 }
             }
             if (!chunk.isEmpty()) {
@@ -192,7 +219,7 @@ public class ShardExecutor {
                     c.lastCursor = resumeBeforeFailure(r, c.lastCursor);
                     return;
                 }
-                maybeReportProgress(d, c, lastProgressAt);
+                maybeReportProgress(d, c, lastProgressAt, attempt);
             }
         }
     }
@@ -227,7 +254,7 @@ public class ShardExecutor {
                             failedSnapshot + sr.rowsFailed(),
                             filteredSnapshot + sr.rowsFiltered() + failedSnapshot + sr.rowsFailed(),
                             dedupedSnapshot + sr.rowsDeduped(),
-                            null, null);
+                            leaseOwner, null, null);
                     dltWriter.insertAll(conn, d.getTaskId(), d.getRunId(), d.getShardId(), sr.failures());
                     return sr;
                 } catch (SQLException e) {
@@ -244,7 +271,7 @@ public class ShardExecutor {
                     failedSnapshot + result.rowsFailed(),
                     filteredSnapshot + result.rowsFiltered() + failedSnapshot + result.rowsFailed(),
                     dedupedSnapshot + result.rowsDeduped(),
-                    null, null);
+                    leaseOwner, null, null);
             dltWriter.insertAll(d.getTaskId(), d.getRunId(), d.getShardId(), result.failures());
         }
         c.rowsOut += result.rowsOut();
@@ -280,15 +307,26 @@ public class ShardExecutor {
         checkpointWriter.upsert(d.getTaskId(), d.getRunId(), d.getShardId(), status,
                 cursor, c.lastPk, attempt,
                 c.rowsIn, c.rowsOut, c.rowsFiltered, c.rowsFailed, c.rowsDropped(), c.rowsDeduped,
-                errorClass, errorDetail);
+                leaseOwner, errorClass, errorDetail);
     }
 
-    private long maybeReportProgress(ShardDispatch d, Counters c, long lastProgressAt) {
+    private long maybeReportProgress(ShardDispatch d, Counters c, long lastProgressAt, int attempt) {
         long now = System.currentTimeMillis();
         long interval = Math.max(0, properties.getProgressIntervalMs());
         if (interval == 0 || now - lastProgressAt >= interval) {
             reporter.reportProgress(new ShardProgress(d.getTaskId(), d.getRunId(), d.getShardId(),
                     c.rowsIn, c.rowsOut, now));
+            // WP-11：进度上报同时续约 lease；续约失败说明已被新 worker 接管，
+            // 后续 checkpoint 写入会被 lease fencing 拒绝（此处不打断当前批，避免半批回滚）。
+            if (properties.getLeaseSeconds() > 0) {
+                int renewed = checkpointWriter.renewLease(d.getTaskId(), d.getRunId(), d.getShardId(),
+                        leaseOwner, attempt,
+                        new Timestamp(now + properties.getLeaseSeconds() * 1000L));
+                if (renewed == 0) {
+                    log.warn("shard {} lease lost run={} attempt={} owner={}",
+                            d.getShardId(), d.getRunId(), attempt, leaseOwner);
+                }
+            }
             return now;
         }
         return lastProgressAt;

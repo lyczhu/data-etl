@@ -4,6 +4,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.EtlShardStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.scheduler.AcceptanceSweeper;
 import com.lawyus.dataetl.taskmanagement.orchestrator.scheduler.BackoffReleaseSweeper;
+import com.lawyus.dataetl.taskmanagement.orchestrator.scheduler.ConvergenceSweeper;
 import com.lawyus.dataetl.taskmanagement.orchestrator.scheduler.DispatchTimeoutSweeper;
 import com.lawyus.dataetl.taskmanagement.orchestrator.scheduler.StallAndCancelSweeper;
 import org.junit.jupiter.api.DisplayName;
@@ -42,6 +43,9 @@ class SweeperIT extends AbstractOrchestratorIT {
 
     @Autowired
     private AcceptanceSweeper acceptanceSweeper;
+
+    @Autowired
+    private ConvergenceSweeper convergenceSweeper;
 
     @Test
     @DisplayName("心跳丢失但 worker 仍在跑：不回退 QUEUED，而是 CAS 补登记 RUNNING（§7.9）")
@@ -231,6 +235,42 @@ class SweeperIT extends AbstractOrchestratorIT {
         assertThat(jdbc.queryForObject("SELECT shard_total FROM etl_task_run WHERE run_id = ?",
                 Integer.class, runId)).isEqualTo(3);
         // 20 行 / chunk 8 → [1,7] [8,14] [15,20]，主键闭区间持久化（§7.2 派工只带区间不带数据）
+        assertThat(shardRanges(runId)).containsExactly("shard-0:1-7", "shard-1:8-14", "shard-2:15-20");
+        assertThat(shardStatuses(runId).values()).containsOnly("PENDING");
+    }
+
+    @Test
+    @DisplayName("最后一条 results 丢失：sweeper 无活跃分片时重算聚合，仍能收敛 SUCCEEDED")
+    void resultLostConvergesWithoutResults() {
+        String taskId = seedTask(ItInfra.SOURCE_TABLE, "it_target_result_lost");
+        String runId = seedRun(taskId, RUNNING, 1, 1);
+        seedCheckpoint(taskId, runId, "shard-0", EtlShardStatus.SUCCEEDED, 20, 20, 0);
+        routing.setNewWorker(true);
+
+        convergenceSweeper.sweep();
+
+        assertThat(runStatus(runId)).isEqualTo(EtlTaskStatus.SUCCEEDED);
+        assertThat(runLongColumn(runId, "rows_in")).as("sweeper 驱动的终局也要投影计数").isEqualTo(20L);
+        assertThat(runLongColumn(runId, "rows_out")).isEqualTo(20L);
+        assertThat(taskStatus(taskId)).isEqualTo("SUCCEEDED");
+    }
+
+    @Test
+    @DisplayName("T31 重放：计划已落库但 CREATED 未推进，重放删旧插新不撞唯一键")
+    void createdStuckWithExistingPlan_replaysIdempotently() {
+        long dataSourceId = stubDataSource();
+        String taskId = seedTaskBoundTo(ItInfra.SOURCE_TABLE, "it_target_replay_existing", dataSourceId);
+        String runId = seedRun(taskId, EtlTaskStatus.CREATED, 1, 3);
+        seedCheckpoint(taskId, runId, "shard-0", EtlShardStatus.PENDING, 0, 0, 0);
+        seedCheckpoint(taskId, runId, "shard-1", EtlShardStatus.PENDING, 0, 0, 0);
+        seedCheckpoint(taskId, runId, "shard-2", EtlShardStatus.PENDING, 0, 0, 0);
+        backdateRunUpdatedAt(runId, Duration.ofSeconds(30));
+
+        routing.setNewWorker(true);
+        orchProps.setCreatedTimeout(Duration.ofSeconds(5));
+        acceptanceSweeper.sweep();
+
+        assertThat(runStatus(runId)).isEqualTo(QUEUED);
         assertThat(shardRanges(runId)).containsExactly("shard-0:1-7", "shard-1:8-14", "shard-2:15-20");
         assertThat(shardStatuses(runId).values()).containsOnly("PENDING");
     }

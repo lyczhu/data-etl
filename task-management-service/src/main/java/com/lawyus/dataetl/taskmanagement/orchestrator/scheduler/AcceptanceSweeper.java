@@ -4,6 +4,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.ErrorClass;
 import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
@@ -41,19 +42,22 @@ public class AcceptanceSweeper {
     private final OrchestratorProperties properties;
     private final RunValidator runValidator;
     private final RoutingProperties routing;
+    private final OrchestratorMetrics metrics;
 
     public AcceptanceSweeper(RedissonClient redisson,
                              EtlTaskRunRepository runRepository,
                              OrchestratorService orchestrator,
                              OrchestratorProperties properties,
                              RunValidator runValidator,
-                             RoutingProperties routing) {
+                             RoutingProperties routing,
+                             OrchestratorMetrics metrics) {
         this.redisson = redisson;
         this.runRepository = runRepository;
         this.orchestrator = orchestrator;
         this.properties = properties;
         this.runValidator = runValidator;
         this.routing = routing;
+        this.metrics = metrics;
     }
 
     @Scheduled(fixedRate = 30_000)
@@ -77,6 +81,7 @@ public class AcceptanceSweeper {
                         .maxAttempts(properties.getMaxAttempts()).build();
                 try {
                     orchestrator.transition(run.getRunId(), EtlTaskStatus.VALIDATED, EtlTaskStatus.FAILED, ctx);
+                    metrics.sweeperAction("acceptance");
                     log.info("AcceptanceSweeper T30 run={} VALIDATED->FAILED (ENQUEUE_STALLED)", run.getRunId());
                 } catch (GuardFailureException | IllegalStateTransitionException e) {
                     log.warn("AcceptanceSweeper T30 skipped run={} cause={}", run.getRunId(), e.getMessage());
@@ -99,6 +104,7 @@ public class AcceptanceSweeper {
             log.info("AcceptanceSweeper T31 replay validate run={} (CREATED stuck)", run.getRunId());
             try {
                 runValidator.validateAndQueue(run.getTaskId(), run.getRunId());
+                metrics.sweeperAction("acceptance");
             } catch (RuntimeException e) {
                 log.warn("AcceptanceSweeper T31 replay failed run={}: {}", run.getRunId(), e.getMessage());
             }

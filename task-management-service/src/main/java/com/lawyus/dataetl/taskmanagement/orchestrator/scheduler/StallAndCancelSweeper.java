@@ -4,6 +4,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.ErrorClass;
 import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
@@ -37,17 +38,20 @@ public class StallAndCancelSweeper {
     private final EtlTaskCheckpointRepository checkpointRepository;
     private final OrchestratorService orchestrator;
     private final OrchestratorProperties properties;
+    private final OrchestratorMetrics metrics;
 
     public StallAndCancelSweeper(RedissonClient redisson,
                                  EtlTaskRunRepository runRepository,
                                  EtlTaskCheckpointRepository checkpointRepository,
                                  OrchestratorService orchestrator,
-                                 OrchestratorProperties properties) {
+                                 OrchestratorProperties properties,
+                                 OrchestratorMetrics metrics) {
         this.redisson = redisson;
         this.runRepository = runRepository;
         this.checkpointRepository = checkpointRepository;
         this.orchestrator = orchestrator;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     @Scheduled(fixedRate = 30_000)
@@ -107,6 +111,7 @@ public class StallAndCancelSweeper {
                                 String op, String extra) {
         try {
             orchestrator.transition(runId, from, to, ctx);
+            metrics.sweeperAction("stall-cancel");
             log.info("StallAndCancelSweeper[{}] run={} {} -> {} {}", op, runId, from, to, extra == null ? "" : extra);
         } catch (GuardFailureException | IllegalStateTransitionException e) {
             log.warn("StallAndCancelSweeper[{}] skipped run={} {} -> {} cause={}", op, runId, from, to, e.getMessage());

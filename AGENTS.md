@@ -77,6 +77,18 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
 - G-4 / INV-4 balance is **four-term**: `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in`. A crash after
   the target commit but before the checkpoint write replays the same rows, so `rows_in` and `rows_deduped` both grow by
   the same amount. Do not exclude `rows_deduped` — that turns a correct idempotent replay into `NEEDS_ATTENTION`.
+- Checkpoint fencing is **dual-key**: every worker write must match `shard_attempt` *and* `lease_owner` (see
+  `CheckpointWriter`). `tryAcquireLease` advances `shard_attempt` with `GREATEST(...)`; `/resume` and `/retry` clear leases
+  via the `__reclaimed__` sentinel. Dropping either condition lets a late write from a superseded worker overwrite the new
+  attempt (Gate 2).
+- Global dispatch permits come from the **database**: `COUNT(etl_task_checkpoint.status IN ('ASSIGNED','RUNNING'))` against
+  `etl.dispatch.max-concurrent-shards`, read fresh on every call (`TokenBucket`). A JVM `Semaphore` is not a global
+  authority and must not be reintroduced. `DispatchService.dispatchOne` runs under
+  `pg_advisory_xact_lock(hashtext('etl:dispatch:permits'))` so multiple orchestrators cannot overshoot the same free slot.
+- Target-table DDL belongs to **V-3** (`TargetTableManager`): one-time create plus `idempotency_key` UNIQUE under a target-DB
+  advisory lock. Workers must not call `ensureTargetTable` per shard; a failed V-3 becomes `FAILED(TARGET_UNWRITABLE)`.
+- `etl.routing.new-worker` stays **false** until all Gate 2 evidence exists (multi-JVM orchestrator, real alert firing,
+  rollback drill). Phase 1B code being green is not sufficient to flip it.
 
 ## Toolchain
 

@@ -11,5 +11,13 @@ public record SourceSpec(ConnectorType connectorType,
                          String username,
                          String password,
                          String driverClassName,
-                         String table) {
+                         String table,
+                         /** 查询超时秒数（WP-17）；<=0 表示不设置。 */
+                         int queryTimeoutSeconds) {
+
+    /** 兼容旧调用：不设置查询超时。 */
+    public SourceSpec(ConnectorType connectorType, String url, String username, String password,
+                      String driverClassName, String table) {
+        this(connectorType, url, username, password, driverClassName, table, 0);
+    }
 }

@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
@@ -42,6 +43,7 @@ class DispatchServicePumpTest {
     private DispatchProperties dispatchProperties;
     private RoutingProperties routing;
     private OrchestratorMetrics metrics;
+    private JdbcTemplate jdbcTemplate;
     private DispatchService self;
     private DispatchService service;
 
@@ -57,9 +59,10 @@ class DispatchServicePumpTest {
         dispatchProperties = new DispatchProperties();   // permitsPerRun=8, pumpBatch=50
         routing = new RoutingProperties();
         metrics = mock(OrchestratorMetrics.class);
+        jdbcTemplate = mock(JdbcTemplate.class);
         self = mock(DispatchService.class);
         service = new DispatchService(redisson, runRepository, checkpointRepository, orchestrator,
-                tokenBucket, assembler, publisher, dispatchProperties, routing, metrics, self);
+                tokenBucket, assembler, publisher, dispatchProperties, routing, metrics, jdbcTemplate, self);
     }
 
     private EtlTaskRun run(String status) {

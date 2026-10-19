@@ -75,7 +75,16 @@ public class DltListener {
             log.warn("dlt: unparsable payload skipped: {}", parseFailure.getMessage());
             return;
         }
-        handle(msg);
+        if (msg.getRunId() == null || msg.getRunId().isEmpty()) {
+            log.warn("dlt: message without runId, nothing to attach");
+            return;
+        }
+        try {
+            KafkaMdc.put(msg.getTaskId(), msg.getRunId(), msg.getShardId(), null);
+            handle(msg);
+        } finally {
+            KafkaMdc.clear();
+        }
     }
 
     void handle(DltMessage msg) {
@@ -86,10 +95,6 @@ public class DltListener {
                     msg.getRunId(), msg.getShardId(), msg.getErrorClass());
             return;
         }
-        if (msg.getRunId() == null || msg.getRunId().isEmpty()) {
-            log.warn("dlt: message without runId, nothing to attach");
-            return;
-        }
         tokenBucket.releaseWithinCapacity(1);   // 毒分片终止，归还令牌
 
         Optional<EtlTaskRun> found = runRepository.findByRunId(msg.getRunId());
@@ -98,6 +103,7 @@ public class DltListener {
             return;
         }
         EtlTaskRun run = found.get();
+        KafkaMdc.putAttempt(run.getAttemptNo());
         EtlTaskStatus current = run.statusEnum();
         if (current.isTerminal()) {
             return;   // 终态不可回退

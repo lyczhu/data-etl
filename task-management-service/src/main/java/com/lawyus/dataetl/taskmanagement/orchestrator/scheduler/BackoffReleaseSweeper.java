@@ -3,6 +3,7 @@ package com.lawyus.dataetl.taskmanagement.orchestrator.scheduler;
 import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
@@ -34,15 +35,18 @@ public class BackoffReleaseSweeper {
     private final EtlTaskRunRepository runRepository;
     private final OrchestratorService orchestrator;
     private final OrchestratorProperties properties;
+    private final OrchestratorMetrics metrics;
 
     public BackoffReleaseSweeper(RedissonClient redisson,
                                  EtlTaskRunRepository runRepository,
                                  OrchestratorService orchestrator,
-                                 OrchestratorProperties properties) {
+                                 OrchestratorProperties properties,
+                                 OrchestratorMetrics metrics) {
         this.redisson = redisson;
         this.runRepository = runRepository;
         this.orchestrator = orchestrator;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     @Scheduled(fixedRate = 15_000)
@@ -97,6 +101,7 @@ public class BackoffReleaseSweeper {
     private void safeTransition(String runId, EtlTaskStatus from, EtlTaskStatus to, TransitionContext ctx, String op) {
         try {
             orchestrator.transition(runId, from, to, ctx);
+            metrics.sweeperAction("backoff-release");
             log.info("BackoffReleaseSweeper[{}] run={} {} -> {}", op, runId, from, to);
         } catch (GuardFailureException | IllegalStateTransitionException e) {
             log.warn("BackoffReleaseSweeper[{}] skipped run={} {} -> {} cause={}", op, runId, from, to, e.getMessage());

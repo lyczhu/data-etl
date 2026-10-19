@@ -10,6 +10,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskRunRepos
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -56,6 +57,10 @@ public class OrchestratorService implements OrchestratorEngine {
     private final DomainEventPublisher eventPublisher;
     private final OrchestratorProperties properties;
     private final RunCounterProjector counterProjector;
+
+    /** WP-16：可选影子比对；单测上下文无此 bean 时跳过。 */
+    @Autowired(required = false)
+    private ShadowCompareService shadowCompareService;
 
     public OrchestratorService(EtlTaskRunRepository runRepository,
                                EtlTaskCheckpointRepository checkpointRepository,
@@ -152,6 +157,11 @@ public class OrchestratorService implements OrchestratorEngine {
 
         // §6.3 Phase 1：提交后外发（Kafka 投递由接线切片的 AFTER_COMMIT 监听器承接）
         eventPublisher.publishAfterCommit(new EtlTaskTransitioned(runId, ctx.taskId(), from, to, ctx));
+
+        // WP-16：终态做一次影子比对（仅 shadow-compare=true 且旧链路有计数时；不改状态）
+        if (to.isTerminal() && shadowCompareService != null && ctx.taskId() != null) {
+            shadowCompareService.compare(ctx.taskId(), runId);
+        }
 
         return runRepository.findByRunId(runId).orElse(run);
     }

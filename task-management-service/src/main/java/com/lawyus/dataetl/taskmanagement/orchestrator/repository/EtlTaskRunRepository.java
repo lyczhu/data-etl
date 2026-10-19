@@ -25,6 +25,9 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
 
     Optional<EtlTaskRun> findByRunId(String runId);
 
+    /** 各状态 run 数（WP-15 Gauge：etl.run.state.count）。 */
+    long countByStatus(String status);
+
     Optional<EtlTaskRun> findFirstByTaskIdAndIsCurrentTrue(String taskId);
 
     List<EtlTaskRun> findByTaskIdOrderByAttemptNoDesc(String taskId);

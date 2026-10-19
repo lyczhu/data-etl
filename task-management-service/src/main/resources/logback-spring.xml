@@ -3,7 +3,7 @@
     <!-- 控制台输出 -->
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [trace:%X{traceId:-},span:%X{spanId:-},task:%X{taskId:-}] %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [trace:%X{traceId:-},span:%X{spanId:-},task:%X{taskId:-},run:%X{runId:-},shard:%X{shardId:-},attempt:%X{attemptNo:-}] %logger{36} - %msg%n</pattern>
         </encoder>
     </appender>
 
@@ -21,7 +21,7 @@
             </timeBasedFileNamingAndTriggeringPolicy>
         </rollingPolicy>
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [trace:%X{traceId:-},span:%X{spanId:-},task:%X{taskId:-}] %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [trace:%X{traceId:-},span:%X{spanId:-},task:%X{taskId:-},run:%X{runId:-},shard:%X{shardId:-},attempt:%X{attemptNo:-}] %logger{36} - %msg%n</pattern>
         </encoder>
     </appender>
 

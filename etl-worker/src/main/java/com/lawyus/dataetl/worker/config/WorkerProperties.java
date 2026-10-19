@@ -33,6 +33,10 @@ public class WorkerProperties {
     private boolean sameDatabaseTransaction = true;
     /** 分片 lease 续约时长（秒，WP-11）。 */
     private long leaseSeconds = 120;
+    /** lease owner；为空时由 worker 启动时按 pid@host + UUID 生成（WP-11）。 */
+    private String leaseOwner;
+    /** 源端查询超时秒数（WP-17）；0 表示不设置。 */
+    private int queryTimeoutSeconds = 600;
 
     public int getChunkSize() { return chunkSize; }
     public void setChunkSize(int chunkSize) { this.chunkSize = chunkSize; }
@@ -56,4 +60,8 @@ public class WorkerProperties {
     public void setSameDatabaseTransaction(boolean sameDatabaseTransaction) { this.sameDatabaseTransaction = sameDatabaseTransaction; }
     public long getLeaseSeconds() { return leaseSeconds; }
     public void setLeaseSeconds(long leaseSeconds) { this.leaseSeconds = leaseSeconds; }
+    public String getLeaseOwner() { return leaseOwner; }
+    public void setLeaseOwner(String leaseOwner) { this.leaseOwner = leaseOwner; }
+    public int getQueryTimeoutSeconds() { return queryTimeoutSeconds; }
+    public void setQueryTimeoutSeconds(int queryTimeoutSeconds) { this.queryTimeoutSeconds = queryTimeoutSeconds; }
 }

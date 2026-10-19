@@ -1,6 +1,7 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator.scheduler;
 
 import com.lawyus.dataetl.taskmanagement.orchestrator.ConvergenceService;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunAggregate;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
@@ -30,17 +31,20 @@ public class ConvergenceSweeper {
     private final EtlTaskCheckpointRepository checkpointRepository;
     private final ConvergenceService convergenceService;
     private final RoutingProperties routing;
+    private final OrchestratorMetrics metrics;
 
     public ConvergenceSweeper(RedissonClient redisson,
                               EtlTaskRunRepository runRepository,
                               EtlTaskCheckpointRepository checkpointRepository,
                               ConvergenceService convergenceService,
-                              RoutingProperties routing) {
+                              RoutingProperties routing,
+                              OrchestratorMetrics metrics) {
         this.redisson = redisson;
         this.runRepository = runRepository;
         this.checkpointRepository = checkpointRepository;
         this.convergenceService = convergenceService;
         this.routing = routing;
+        this.metrics = metrics;
     }
 
     @Scheduled(fixedRate = 30_000)
@@ -60,6 +64,7 @@ public class ConvergenceSweeper {
                 }
                 boolean acted = convergenceService.converge(run, a, "sweeper:convergence");
                 if (acted) {
+                    metrics.sweeperAction("convergence");
                     log.info("ConvergenceSweeper run={} converged without results", run.getRunId());
                 }
             }

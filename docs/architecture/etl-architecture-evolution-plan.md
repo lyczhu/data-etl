@@ -281,6 +281,21 @@ POST /api/tasks
 - 告警可触发；`/progress`/`/cancel`/`/failures` 可用；网关路由可达。
 - 回滚演练通过：无孤儿 run、无重复写入。
 
+**执行状态（2026-10-19，本地可执行部分）**
+
+- [x] **WP-10 收敛与守卫**：`ConvergenceSweeper` 无 results 时重算聚合；T31 重放删旧计划再插入（`RunPlanWriter`）；G-2 总和、G-7 DLT_CLEAN/T19 failed=0 在 `GuardChain`/`ConvergencePolicy`。证据：`SweeperIT`（含“结果丢失收敛”“计划已落库 T31 重放”）、`ConvergenceGuardIT`。
+- [x] **WP-11 lease/fencing**：`CheckpointWriter.tryAcquireLease/renewLease` 带 `lease_owner + lease_until + shard_attempt` 三重条件；lease 接管后旧 worker 迟到写入被拒；`/resume`/`/retry` 用 `__reclaimed__` 哨兵回收 lease。证据：`LeaseFencingIT`、`CheckpointWriterSqlTest`、`ShardExecutorTest`。audit 表落库仍归 Phase 2（当前为结构化 WARN 日志）。
+- [x] **WP-12 全局许可**：`TokenBucket` 改为 DB `COUNT(ASSIGNED/RUNNING)` 真源，`DispatchService.dispatchOne` 事务内取 PG advisory lock；容量按配置动态读取。证据：`GlobalPermitIT`（两个 orchestrator 等价实例共享同一份许可）、`EntryChainIT` T6、`FullDispatchScaleIT` 120 分片。
+- [x] **WP-13 目标表治理**：`TargetTableManager` V-3 在目标库 advisory lock 下一次性建表/补 `idempotency_key` 唯一索引；worker 删除每分片 `ensureTargetTable`。存量重复键不在线自动删数据，建唯一索引失败即 V-3 失败并提示清洗。证据：`TargetTableGovernanceIT`、`FullChainE2EIT`（目标表由 V-3 建出后真搬 20 行）。
+- [x] **WP-14 API 最小闭环**：`GET /progress`、`GET /failures`、`POST /cancel|retry|resume|abort|mark-succeeded-with-data-loss`；无 current run→404、非法状态/guard→409。证据：`EtlTaskControllerTest`；网关 `gateway-service-routes.yml` 已有 `/api/tasks/**`→`lb://task-management-service`。
+- [x] **WP-15 观测**：`RunStateMetrics` 产出 `etl.run.state.count`/`etl.checkpoint.lag.seconds`/`etl.dlt.unresolved.size`；各 sweeper 产出 `etl.sweeper.actions.total`；`alerts.yml` 新增 `etl-orchestrator-alerts`（NEEDS_ATTENTION/DLT/checkpoint lag）；Kafka 监听器 MDC 补 `runId/shardId/attemptNo`，logback pattern 同步。告警实际触发仍需 Prometheus/Alertmanager 环境。
+- [x] **WP-16 迁移能力**：白名单 `etl.routing.data-source-whitelist` + `isNewWorkerFor` 已在 Phase 1A 落地；新增 `ShadowCompareService`（旧 `completed_records` vs 新 `rows_out`，仅 shadow-compare=true 且旧计数>0）；回滚 runbook 见 `docs/architecture/e2e-runbook.md`。真实回滚演练未执行（需环境）。
+- [x] **WP-17 源端一致性**：分片计划冻结 `pkTo`（主键高水位），run 期间新行不进入本次 run；`SourceSpec.queryTimeoutSeconds` + MySQL `Integer.MIN_VALUE` 流式 fetch；`WorkerProperties.query-timeout-seconds` 默认 600s。证据：`SourceSnapshotIT`。源端取消仍靠 lease/超时，未做服务端 cancel 协议。
+- [x] **WP-18 契约与文档**：`KafkaContractTest` 锁 dispatch/results/progress/dlt 字段与“派工不含连接/口令”；`orchestrator-design.md`、`connector-spi.md`、`AGENTS.md` 同步 lease/DB 许可/V-3 约束。
+- [ ] **Gate 2 环境型证据**：告警实际触发、真实回滚演练、2 个独立 orchestrator JVM（当前用两个 `TokenBucket` 实例 + 同库验证）、真实进程级 lease 抢占仍待环境。
+
+> 结论：Phase 1B 的代码与本地可执行验收已收口（`mvn test` 141 例、`-Pit` 50 例，0 failures/0 skipped）；环境型 Gate 2 证据未完成前，`etl.routing.new-worker` 继续默认 `false`。
+
 ### Phase 1C · 灰度（4 周：1 个 dataSource 观察 7 天 + 3 个放量阶段各 1 周）
 
 **目标**：在真实业务上验证新旧链路一致性和回滚能力。

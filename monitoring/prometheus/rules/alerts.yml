@@ -87,3 +87,34 @@ groups:
         annotations:
           summary: "Kafka consumer lag high on {{ $labels.client_id }}"
           description: "消费 lag > 5000 持续 10m；存在背压/吞吐瓶颈。"
+
+  # Phase 1B 控制面告警（WP-15 / Gate 2）：指标由 RunStateMetrics + OrchestratorMetrics 产出。
+  - name: etl-orchestrator-alerts
+    rules:
+      - alert: EtlRunNeedsAttention
+        expr: sum(etl_run_state_count{state="NEEDS_ATTENTION"}) > 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "ETL run 需要人工介入"
+          description: "存在 NEEDS_ATTENTION run 超过 10m；查 /api/tasks/{taskId}/failures 与 /progress。"
+
+      - alert: EtlDltUnresolved
+        expr: max(etl_dlt_unresolved_size) > 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "未解决 DLT 行堆积"
+          description: "etl_task_dlt 存在未解决行超过 10m；修复数据后重试，勿直接改状态。"
+
+      - alert: EtlCheckpointLagHigh
+        expr: max(etl_checkpoint_lag_seconds) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "checkpoint 写入停滞"
+          description: "全局 checkpoint 最近写入距今 > 300s；worker 可能停摆或 lease 被占。"
+

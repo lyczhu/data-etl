@@ -62,6 +62,19 @@ public class OrchestratorMetrics {
         named("etl.dlt.received.total").increment();
     }
 
+    /** 各 sweeper 实际推进了一次状态迁移（WP-15，带低基数 sweeper 标签）。 */
+    public void sweeperAction(String sweeper) {
+        Counter.builder("etl.sweeper.actions.total")
+                .tag("sweeper", sweeper)
+                .register(registry)
+                .increment();
+    }
+
+    /** 影子比对不一致（WP-16，低基数，不改变状态）。 */
+    public void shadowMismatch() {
+        named("etl.shadow.compare.mismatch.total").increment();
+    }
+
     private Counter named(String name) {
         return Counter.builder(name).register(registry);
     }

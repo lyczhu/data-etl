@@ -2,6 +2,7 @@ package com.lawyus.dataetl.taskmanagement.orchestrator.validate;
 
 import com.lawyus.dataetl.connector.spi.model.Shard;
 import com.lawyus.dataetl.connector.spi.model.ShardPlan;
+import com.lawyus.dataetl.connector.spi.model.TableSchema;
 import com.lawyus.dataetl.taskmanagement.client.DataSource;
 import com.lawyus.dataetl.taskmanagement.client.DataSourceServiceClient;
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
@@ -30,7 +31,8 @@ import java.util.List;
  * <ul>
  *   <li>V-1 数据源存在且可达：{@link DataSourceServiceClient} 解析 {@link DataSource}；</li>
  *   <li>V-2 源表可读且 connector 已注册：{@link ShardPlanner} 经 SPI 查找并 {@code readSchema}（隐含在 planShards）；</li>
- *   <li>V-3 目标表可建：Phase 1 轻校验目标表名存在（实际建表由 worker {@code ensureTargetTable}）；</li>
+ *   <li>V-3 目标表可建/可写：{@link TargetTableManager} 在目标库 advisory lock 下一次性建表，
+ *       存量表补 {@code idempotency_key} 唯一键（WP-13；worker 不再每分片建表）；</li>
  *   <li>V-4 分片计划数 ∈ [1, {@code shard-max-total}]。</li>
  * </ul>
  *
@@ -48,19 +50,22 @@ public class RunValidator {
     private final RunPlanWriter planWriter;
     private final OrchestratorService orchestrator;
     private final DispatchProperties dispatchProperties;
+    private final TargetTableManager targetTableManager;
 
     public RunValidator(EtlTaskRepository taskRepository,
                         DataSourceServiceClient dataSourceServiceClient,
                         ShardPlanner shardPlanner,
                         RunPlanWriter planWriter,
                         OrchestratorService orchestrator,
-                        DispatchProperties dispatchProperties) {
+                        DispatchProperties dispatchProperties,
+                        TargetTableManager targetTableManager) {
         this.taskRepository = taskRepository;
         this.dataSourceServiceClient = dataSourceServiceClient;
         this.shardPlanner = shardPlanner;
         this.planWriter = planWriter;
         this.orchestrator = orchestrator;
         this.dispatchProperties = dispatchProperties;
+        this.targetTableManager = targetTableManager;
     }
 
     public void validateAndQueue(String taskId, String runId) {
@@ -89,9 +94,22 @@ public class RunValidator {
             fail(runId, taskId, "SHARD_PLAN_OUT_OF_RANGE(" + shardCount + ")");
             return;
         }
-        // V-3 目标表可建（Phase 1 轻校验表名；实际建表在 worker）
+        // V-3 目标表可建/可写（WP-13）：目标库 advisory lock 下一次性建表；存量表补幂等键。
         if (task.getTargetTableName() == null || task.getTargetTableName().isBlank()) {
             fail(runId, taskId, "TARGET_TABLE_MISSING");
+            return;
+        }
+        TableSchema sourceSchema;
+        try {
+            sourceSchema = shardPlanner.readSchema(ds, task.getSourceTableName());
+        } catch (RuntimeException schemaFailure) {
+            fail(runId, taskId, "SOURCE_SCHEMA_UNREADABLE: " + schemaFailure.getMessage());
+            return;
+        }
+        try {
+            targetTableManager.ensure(task, sourceSchema);
+        } catch (RuntimeException targetFailure) {
+            fail(runId, taskId, "TARGET_UNWRITABLE: " + targetFailure.getMessage());
             return;
         }
 

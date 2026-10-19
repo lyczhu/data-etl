@@ -28,8 +28,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>这里不启动 worker：本用例只验证“派工侧把计划全部发出去”。真实执行与收敛由
  * {@link FullChainE2EIT} 的 {@code crashAfterTargetCommitReplaysIdempotently} /
  * {@code duplicateDispatchAndResultsAreIdempotent} 与 {@link TwoWorkerConcurrencyIT} 覆盖。
- * 令牌用 {@code release} 模拟 worker 完成后的归还，否则全局桶（24）会按背压语义把派工停在 24 片——
- * 那正是 THROTTLED 的正确行为，不是本用例要证伪的对象。
+ * WP-12 后全局许可真源是 DB 活跃分片数，因此本用例把 {@code max-concurrent-shards}
+ * 临时调到 120，验证“容量足够时一次 pump 全部派完”。
  */
 class FullDispatchScaleIT extends AbstractOrchestratorIT {
 
@@ -44,7 +44,7 @@ class FullDispatchScaleIT extends AbstractOrchestratorIT {
 
     private int originalPermitsPerRun;
     private int originalShardTargetCount;
-    private int originalAvailablePermits;
+    private int originalMaxConcurrentShards;
 
     @BeforeAll
     static void createItTopics() {
@@ -56,7 +56,7 @@ class FullDispatchScaleIT extends AbstractOrchestratorIT {
         holdDispatchPumpLock();
         originalPermitsPerRun = dispatchProps.getPermitsPerRun();
         originalShardTargetCount = dispatchProps.getShardTargetCount();
-        originalAvailablePermits = tokenBucket.available();
+        originalMaxConcurrentShards = dispatchProps.getMaxConcurrentShards();
         seedScaleSource();
     }
 
@@ -64,11 +64,7 @@ class FullDispatchScaleIT extends AbstractOrchestratorIT {
     void restoreScaleFixtures() {
         dispatchProps.setPermitsPerRun(originalPermitsPerRun);
         dispatchProps.setShardTargetCount(originalShardTargetCount);
-        // 把用例多释放的令牌收回，避免 available 超过容量污染其它 IT 的背压断言
-        int surplus = tokenBucket.available() - originalAvailablePermits;
-        if (surplus > 0) {
-            tokenBucket.tryAcquireUpTo(surplus);
-        }
+        dispatchProps.setMaxConcurrentShards(originalMaxConcurrentShards);
         jdbc.execute("DROP TABLE IF EXISTS " + SCALE_SOURCE_TABLE);
     }
 
@@ -78,7 +74,7 @@ class FullDispatchScaleIT extends AbstractOrchestratorIT {
         routing.setNewWorker(true);
         dispatchProps.setShardTargetCount(SCALE_ROWS);
         dispatchProps.setPermitsPerRun(SCALE_ROWS);
-        tokenBucket.release(SCALE_ROWS + 16);   // 模拟 worker 持续归还令牌
+        dispatchProps.setMaxConcurrentShards(SCALE_ROWS);   // WP-12：DB 全局许可容量
 
         long dataSourceId = stubDataSource();
         EtlTask request = new EtlTask();

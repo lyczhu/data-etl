@@ -17,6 +17,12 @@ public record ResolvedDataSource(Long id,
         return new SourceSpec(connectorType, url, username, password, driverClassName, table);
     }
 
+    /** WP-17：带查询超时的源规格。 */
+    public SourceSpec toSourceSpec(ConnectorType connectorType, String table, int queryTimeoutSeconds) {
+        return new SourceSpec(connectorType, url, username, password, driverClassName, table,
+                queryTimeoutSeconds);
+    }
+
     public java.sql.Connection openConnection() {
         try {
             if (driverClassName != null && !driverClassName.isBlank()) {

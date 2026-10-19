@@ -85,7 +85,12 @@ public class ResultsListener {
             log.warn("results: message without runId skipped");
             return;
         }
-        handle(msg);
+        try {
+            KafkaMdc.put(msg.getTaskId(), msg.getRunId(), msg.getShardId(), null);
+            handle(msg);
+        } finally {
+            KafkaMdc.clear();
+        }
     }
 
     void handle(ResultMessage msg) {
@@ -98,6 +103,7 @@ public class ResultsListener {
             return;
         }
         EtlTaskRun run = found.get();
+        KafkaMdc.putAttempt(run.getAttemptNo());
 
         // results 隐含 worker 已在跑：若仍在 DISPATCHED 先补 T7（否则永不收敛）
         if (run.statusEnum() == EtlTaskStatus.DISPATCHED) {

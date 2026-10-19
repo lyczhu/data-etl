@@ -147,4 +147,36 @@ docker compose stop postgres redis kafka
 ### 9.3 ③ 清理
 - `.gitignore` 第 46 行**已含 `e2e-logs/*`**（此前已配置，无需再加）。
 - 已停本次启动的 Java 服务、删除测试数据（`demo_people`、各 `demo_people_<taskId>` 目标表、e2e 数据源行）。infra/监控容器可按需 `docker compose down` 停止。
-- 注：`docs/` 在 `.gitignore` 第 68 行被整体忽略，故本 runbook 与 `docs/architecture/*` 默认不入库——如需版本化架构文档，需调整该规则（属仓库既有约定，未擅自更改）。
+- 注：`docs/` 已不再被 `.gitignore` 整体忽略（仅 `e2e-logs/*` 在库外）；本 runbook 与 `docs/architecture/*` 应随代码一并提交。
+
+## 10. Phase 1B 灰度回滚 runbook（Gate 2 演练项）
+
+> 触发条件：灰度期出现 P0 信号——shadow compare 持续不一致、`NEEDS_ATTENTION` 激增、孤儿 run、目标表重复写入、
+> 或 `/progress` 显示分片长时间无心跳。原则：**只切路由与取消，不手改状态、不删 checkpoint**。
+
+1. **冻结新链路提交**：把 `config-server/src/main/resources/config-repo/task-management-service.yml` 的
+   `etl.routing.new-worker` 改为 `false`（`shadow-compare` 可保留为 `true` 观察），刷新/重启 task-management。
+   确认 `DispatchService.pump()` 直接返回、`isNewWorkerFor()` 全部为 `false`；此时旧链路 `TaskScheduler` 恢复独占。
+2. **处理在途 run**：对每个非终态 run 调 `POST /api/tasks/{taskId}/cancel`；等待 worker ack，超 90s 由
+   `StallAndCancelSweeper` 走 T16 强制取消。**禁止** `UPDATE etl_task_run SET status=...` 或改 `etl_task.status`。
+3. **确认排空**：`GET /api/tasks/{taskId}/progress` 与 `/failures` 确认无新增 `ASSIGNED`；需要续跑时只在旧链路恢复后
+   重新提交，或对新链路 run 用 `POST /resume`（会经 `__reclaimed__` 回收 lease）。
+4. **旧链路接管**：保持旧 worker/旧 topic 消费组在线；新 worker 实例可停，未确认终态的 run 由 cancel 收口。
+5. **回滚后校验**（四条 SQL 均返空才算通过）：
+
+```sql
+-- ① 孤儿 run：非终态且无 ASSIGNED/RUNNING 分片、超过 5 分钟无进度
+SELECT r.run_id, r.status, r.last_progress_ts FROM etl_task_run r
+ WHERE r.is_current AND r.status NOT IN ('SUCCEEDED','FAILED','CANCELLED','SUPERSEDED')
+   AND NOT EXISTS (SELECT 1 FROM etl_task_checkpoint c
+                    WHERE c.run_id=r.run_id AND c.status IN ('ASSIGNED','RUNNING'))
+   AND (r.last_progress_ts IS NULL OR r.last_progress_ts < now() - interval '5 minutes');
+
+-- ② 重复写入：目标表 idempotency_key 必须唯一（UNIQUE 索引存在时理论为空，作回归探测）
+--    SELECT idempotency_key, COUNT(*) FROM <target_table> GROUP BY 1 HAVING COUNT(*) > 1;
+
+-- ③ 计数平衡（G-4 / §12.2 校验 2）与 ④ 多非终态 run（INV-1）见 §12.2 原 SQL
+```
+
+6. **留证**：记录 taskId/runId 时间线、`etl_run_state_count`、`etl_checkpoint_lag_seconds`、`etl_dlt_unresolved_size`、
+   shadow 差异样本；回滚演练报告归档后再评估是否重新开启 `etl.routing.new-worker`。

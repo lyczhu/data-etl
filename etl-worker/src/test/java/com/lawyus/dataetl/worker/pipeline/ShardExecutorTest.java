@@ -44,6 +44,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -85,7 +86,12 @@ class ShardExecutorTest {
         properties.setChunkSize(3);
         properties.setProgressIntervalMs(0);
         properties.setSameDatabaseTransaction(false);
+        properties.setLeaseOwner("worker-test");
         sink = new FakeSink();
+        when(checkpointWriter.tryAcquireLease(anyString(), anyString(), anyString(), anyInt(),
+                anyString(), anyLong())).thenReturn(1);
+        when(checkpointWriter.renewLease(anyString(), anyString(), anyString(), anyString(),
+                anyInt(), any())).thenReturn(1);
     }
 
     private ShardExecutor executor(FakeSource source, RecordTransformer transformer) {
@@ -108,7 +114,7 @@ class ShardExecutorTest {
         verify(reporter, atLeastOnce()).reportProgress(any());
         verify(checkpointWriter).upsert(eq("t-1"), eq("r-1"), eq("shard-0"), eq("SUCCEEDED"),
                 eq("7"), eq("7"), eq(1), eq(8L), eq(8L), eq(0L), eq(0L), eq(0L), eq(0L),
-                isNull(), isNull());
+                eq("worker-test"), isNull(), isNull());
     }
 
     @Test
@@ -171,7 +177,7 @@ class ShardExecutorTest {
         verify(reporter).reportDlt(any(ShardDltMessage.class));
         verify(checkpointWriter).upsert(eq("t-1"), eq("r-1"), eq("shard-0"), eq("FAILED"),
                 eq("1"), eq("2"), eq(1), eq(3L), eq(2L), eq(0L), eq(1L), eq(1L), eq(0L),
-                anyString(), anyString());
+                eq("worker-test"), anyString(), anyString());
     }
 
     @Test
@@ -189,7 +195,7 @@ class ShardExecutorTest {
         assertThat(result.rowsOut()).isEqualTo(3);
         verify(checkpointWriter).upsert(eq("t-1"), eq("r-1"), eq("shard-0"), eq("SUCCEEDED"),
                 any(), any(), eq(1), eq(3L), eq(3L), eq(0L), eq(0L), eq(0L), eq(0L),
-                isNull(), isNull());
+                eq("worker-test"), isNull(), isNull());
     }
 
     @Test
@@ -216,7 +222,7 @@ class ShardExecutorTest {
         assertThat(sink.externalCalls).isEqualTo(1);
         verify(checkpointWriter).upsert(eq(sink.lastConnection), eq("t-1"), eq("r-1"), eq("shard-0"),
                 eq("RUNNING"), eq("1"), eq("1"), eq(1), eq(2L), eq(2L), eq(0L), eq(0L), eq(0L), eq(0L),
-                isNull(), isNull());
+                eq("worker-test"), isNull(), isNull());
         verify(dltWriter).insertAll(eq(sink.lastConnection), eq("t-1"), eq("r-1"), eq("shard-0"),
                 eq(List.of()));
     }

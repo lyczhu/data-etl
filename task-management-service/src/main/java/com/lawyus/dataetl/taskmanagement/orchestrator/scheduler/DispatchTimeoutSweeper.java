@@ -3,6 +3,7 @@ package com.lawyus.dataetl.taskmanagement.orchestrator.scheduler;
 import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
@@ -36,17 +37,20 @@ public class DispatchTimeoutSweeper {
     private final EtlTaskCheckpointRepository checkpointRepository;
     private final OrchestratorService orchestrator;
     private final OrchestratorProperties properties;
+    private final OrchestratorMetrics metrics;
 
     public DispatchTimeoutSweeper(RedissonClient redisson,
                                   EtlTaskRunRepository runRepository,
                                   EtlTaskCheckpointRepository checkpointRepository,
                                   OrchestratorService orchestrator,
-                                  OrchestratorProperties properties) {
+                                  OrchestratorProperties properties,
+                                  OrchestratorMetrics metrics) {
         this.redisson = redisson;
         this.runRepository = runRepository;
         this.checkpointRepository = checkpointRepository;
         this.orchestrator = orchestrator;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     @Scheduled(fixedRate = 15_000)
@@ -95,6 +99,7 @@ public class DispatchTimeoutSweeper {
                 .build();
         try {
             orchestrator.transition(run.getRunId(), EtlTaskStatus.DISPATCHED, to, ctx);
+            metrics.sweeperAction("dispatch-timeout");
             log.info("DispatchTimeoutSweeper run={} action={} -> {}", run.getRunId(), action, to);
         } catch (GuardFailureException | IllegalStateTransitionException e) {
             log.warn("DispatchTimeoutSweeper skipped run={} action={} cause={}", run.getRunId(), action, e.getMessage());

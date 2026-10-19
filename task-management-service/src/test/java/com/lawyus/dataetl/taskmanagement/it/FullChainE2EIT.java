@@ -229,10 +229,8 @@ class FullChainE2EIT extends AbstractOrchestratorIT {
             assertThat(runStatus(runId)).isEqualTo(EtlTaskStatus.QUEUED);
             assertThat(shardStatuses(runId).values()).containsOnly("PENDING");
 
-            // 目标表由 worker 的 buildCreateTable 建出；这里按同一形状预置 shard-0 的已提交数据
-            jdbc.execute("CREATE TABLE " + targetTable + " ("
-                    + "id BIGINT, name VARCHAR(64), amount NUMERIC(10, 2), note VARCHAR(120), "
-                    + "created_at TIMESTAMP, idempotency_key VARCHAR(64) PRIMARY KEY)");
+            // WP-13：目标表由 V-3 在提交时一次性建出（带 idempotency_key 主键）；
+            // 这里按同一形状预置 shard-0 的已提交数据，模拟“sink 已提交、checkpoint 未写”的崩溃窗口。
             for (long pk = 1; pk <= 7; pk++) {
                 jdbc.update("INSERT INTO " + targetTable
                                 + " (id, name, amount, note, created_at, idempotency_key) "

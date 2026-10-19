@@ -61,6 +61,10 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
     @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c WHERE c.runId = :runId")
     Date maxUpdatedAt(@Param("runId") String runId);
 
+    /** WP-15：全局 checkpoint 最近写入时间（etl.checkpoint.lag.seconds 的数据源）。 */
+    @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c")
+    Date globalMaxUpdatedAt();
+
     /**
      * progress 心跳仅刷新 updated_at，不改 shard 状态（§7.3）。
      *
@@ -108,6 +112,7 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
      */
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskCheckpoint c SET c.status = 'PENDING', c.shardAttempt = :attempt, "
+            + "c.leaseOwner = '__reclaimed__', c.leaseUntil = NULL, "
             + "c.errorClass = NULL, c.errorDetail = NULL, c.updatedAt = CURRENT_TIMESTAMP "
             + "WHERE c.runId = :runId AND c.status = 'FAILED'")
     int resetFailedShards(@Param("runId") String runId, @Param("attempt") int attempt);
@@ -115,7 +120,24 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
     /** 人工重试（NEEDS_ATTENTION→QUEUED）：所有非 SUCCEEDED 分片重置为 PENDING。 */
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskCheckpoint c SET c.status = 'PENDING', c.shardAttempt = :attempt, "
+            + "c.leaseOwner = '__reclaimed__', c.leaseUntil = NULL, "
             + "c.errorClass = NULL, c.errorDetail = NULL, c.updatedAt = CURRENT_TIMESTAMP "
             + "WHERE c.runId = :runId AND c.status IN ('FAILED','SKIPPED')")
     int resetRetryableShards(@Param("runId") String runId, @Param("attempt") int attempt);
+
+    /**
+     * WP-11：人工恢复/重试时强制回收本 run 的全部分片 lease。
+     *
+     * <p>不限定 {@code lease_until < now()}：/resume 的语义就是“人工接管”，若旧 worker 仍持有效
+     * lease 而不清理，新派工的分片会被旧 owner 的 lease 拒之门外，run 永久停在 ASSIGNED。
+     * 旧 worker 的后续写入由 lease owner + attempt 双 fencing 拒绝。
+     *
+     * <p>owner 不置 NULL 而置 {@code __reclaimed__}：NULL 会让 upsert 的
+     * “lease_owner IS NULL 也允许写”分支放行旧 worker；哨兵值保证旧 owner 的迟到写入被拒。
+     */
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE EtlTaskCheckpoint c SET c.leaseOwner = '__reclaimed__', c.leaseUntil = NULL, "
+            + "c.updatedAt = CURRENT_TIMESTAMP WHERE c.runId = :runId")
+    int clearLeases(@Param("runId") String runId);
 }

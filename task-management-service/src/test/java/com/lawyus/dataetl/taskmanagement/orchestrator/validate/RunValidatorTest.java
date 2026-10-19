@@ -34,6 +34,7 @@ class RunValidatorTest {
     private RunPlanWriter planWriter;
     private OrchestratorService orchestrator;
     private DispatchProperties dispatchProperties;
+    private TargetTableManager targetTableManager;
     private RunValidator validator;
 
     @BeforeEach
@@ -44,8 +45,9 @@ class RunValidatorTest {
         planWriter = mock(RunPlanWriter.class);
         orchestrator = mock(OrchestratorService.class);
         dispatchProperties = new DispatchProperties();   // shardMaxTotal=5000
+        targetTableManager = mock(TargetTableManager.class);
         validator = new RunValidator(taskRepository, dsClient, shardPlanner, planWriter,
-                orchestrator, dispatchProperties);
+                orchestrator, dispatchProperties, targetTableManager);
     }
 
     private EtlTask task() {

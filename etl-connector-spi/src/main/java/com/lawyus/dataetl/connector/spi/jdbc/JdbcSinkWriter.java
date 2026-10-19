@@ -307,11 +307,16 @@ public class JdbcSinkWriter implements SinkWriter {
 
     /** 可见以便单测；强制 idempotency_key 主键（已存在则不重复追加），类型按目标库映射。 */
     String buildCreateTable(TableSchema schema) {
+        return buildCreateTable(type, schema);
+    }
+
+    /**
+     * 公共 DDL 生成（WP-13：orchestrator V-3 在提交时一次性建表，worker 不再每分片建表）。
+     */
+    public static String buildCreateTable(ConnectorType type, TableSchema schema) {
         List<String> parts = new ArrayList<>();
-        boolean hasIdempotency = false;
         for (ColumnDef c : schema.columns()) {
             if (IDEMPOTENCY_COLUMN.equalsIgnoreCase(c.name())) {
-                hasIdempotency = true;
                 continue;
             }
             String mapped = type == ConnectorType.MYSQL

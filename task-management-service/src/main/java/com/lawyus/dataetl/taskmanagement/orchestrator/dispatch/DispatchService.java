@@ -18,6 +18,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -55,6 +56,7 @@ public class DispatchService {
     private final DispatchProperties dispatchProperties;
     private final RoutingProperties routing;
     private final OrchestratorMetrics metrics;
+    private final JdbcTemplate jdbcTemplate;
     private final DispatchService self;
 
     public DispatchService(RedissonClient redisson,
@@ -67,6 +69,7 @@ public class DispatchService {
                            DispatchProperties dispatchProperties,
                            RoutingProperties routing,
                            OrchestratorMetrics metrics,
+                           JdbcTemplate jdbcTemplate,
                            @Lazy DispatchService self) {
         this.redisson = redisson;
         this.runRepository = runRepository;
@@ -78,6 +81,7 @@ public class DispatchService {
         this.dispatchProperties = dispatchProperties;
         this.routing = routing;
         this.metrics = metrics;
+        this.jdbcTemplate = jdbcTemplate;
         this.self = self;
     }
 
@@ -107,6 +111,9 @@ public class DispatchService {
     @Transactional
     public void dispatchOne(EtlTaskRun run) {
         String runId = run.getRunId();
+        // WP-12：全局许可的真源是 DB 活跃分片数。两个 orchestrator 并发 dispatchOne 时，
+        // 用事务级 advisory lock 串行化“计数 → 派工 → 置 ASSIGNED”，避免同时看到同一份空位而超发。
+        jdbcTemplate.execute("SELECT pg_advisory_xact_lock(hashtext('etl:dispatch:permits'))");
         long pending = checkpointRepository.countPendingShards(runId);
         if (pending <= 0) {
             return;   // 尚无分片计划或已全部派完
