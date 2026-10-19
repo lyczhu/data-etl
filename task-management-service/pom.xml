@@ -58,6 +58,13 @@
             <artifactId>spring-cloud-starter-openfeign</artifactId>
         </dependency>
 
+        <!-- Phase 1 入口链打通：validate 生成 JDBC 分片计划（SourceConnector.planShards）依赖统一 SPI -->
+        <dependency>
+            <groupId>com.lawyus</groupId>
+            <artifactId>etl-connector-spi</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.redisson</groupId>
             <artifactId>redisson-spring-boot-starter</artifactId>

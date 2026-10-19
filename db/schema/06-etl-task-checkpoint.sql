@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS etl_task_checkpoint (
     shard_attempt INT         NOT NULL DEFAULT 0,           -- 分片级重试次数（与 run.attempt_no 解耦，D-11）
     last_cursor   TEXT,                                     -- JDBC: pk 上界；Mongo: _id；File: 行区间+offset；Stream: topic-partition:offset
     last_pk       VARCHAR(128),
+    pk_from       BIGINT,                                    -- 分片主键闭区间下界（validate/T2 落库，供 pump 派工，§7.2）
+    pk_to         BIGINT,                                    -- 分片主键闭区间上界（非 JDBC 源可为空）
     rows_in       BIGINT      NOT NULL DEFAULT 0,           -- 累计单调不减（D-08 / INV-3）
     rows_out      BIGINT      NOT NULL DEFAULT 0,
     rows_dropped  BIGINT      NOT NULL DEFAULT 0,
@@ -27,6 +29,7 @@ CREATE TABLE IF NOT EXISTS etl_task_checkpoint (
 );
 
 COMMENT ON COLUMN etl_task_checkpoint.rows_in IS '跨 attempt 累计实读行数，禁止覆盖式回退';
+COMMENT ON COLUMN etl_task_checkpoint.pk_from IS 'JDBC 分片主键闭区间下界，validate 计划分片时由编排器写入；worker 只读';
 
 -- INV-2：(task_id, run_id, shard_id) 唯一
 CREATE UNIQUE INDEX IF NOT EXISTS ux_checkpoint_shard ON etl_task_checkpoint (task_id, run_id, shard_id);

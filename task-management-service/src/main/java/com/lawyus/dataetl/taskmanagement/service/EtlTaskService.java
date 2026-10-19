@@ -1,6 +1,10 @@
 package com.lawyus.dataetl.taskmanagement.service;
 
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
+import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
+import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
+import com.lawyus.dataetl.taskmanagement.orchestrator.validate.RunValidator;
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,6 +23,15 @@ public class EtlTaskService {
 
     @Autowired
     private EtlTaskRepository etlTaskRepository;
+
+    @Autowired
+    private OrchestratorService orchestrator;
+
+    @Autowired
+    private RunValidator runValidator;
+
+    @Autowired
+    private RoutingProperties routing;
 
     public List<EtlTask> getAllTasks() {
         return etlTaskRepository.findAll();
@@ -56,7 +69,26 @@ public class EtlTaskService {
 
         String uniqueTableName = generateUniqueTableName(task.getSourceTableName(), taskId);
         task.setTargetTableName(uniqueTableName);
-        return etlTaskRepository.save(task);
+        EtlTask saved = etlTaskRepository.save(task);
+
+        // 影子切换（orchestrator-design.md §7.1/§11.2）：新链路开启时建 run + 校验入队；
+        // 关闭时保持旧行为（status="new" 由旧 TaskScheduler 驱动），e2e 零影响。
+        if (routing.isNewWorker()) {
+            submitToStateMachine(saved.getTaskId());
+        }
+        return saved;
+    }
+
+    /** 提交即建 run（CREATED）并异步校验入队；校验失败在 RunValidator 内部转 FAILED，不影响本 HTTP 提交。 */
+    private void submitToStateMachine(String taskId) {
+        try {
+            EtlTaskRun run = orchestrator.createRun(taskId);
+            runValidator.validateAndQueue(taskId, run.getRunId());
+        } catch (RuntimeException e) {
+            // 建 run/校验的基础设施异常（如 Feign/源库不可达）：不抛出（避免 500），
+            // run 若已建则停 CREATED，由 AcceptanceSweeper T31 重放校验链。
+            log.error("submit new-link failed for task {}: {}", taskId, e.getMessage(), e);
+        }
     }
 
     public EtlTask updateTask(Long id, EtlTask taskDetails) {

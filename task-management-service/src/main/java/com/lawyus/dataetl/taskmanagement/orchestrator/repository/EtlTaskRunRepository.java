@@ -73,6 +73,11 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
     @Query("UPDATE EtlTaskRun r SET r.queuedReason = :reason WHERE r.runId = :runId")
     int markQueuedReason(@Param("runId") String runId, @Param("reason") String reason);
 
+    /** T2 校验后写回分片总数（§7.1 副作用），不触碰 status。 */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE EtlTaskRun r SET r.shardTotal = :shardTotal WHERE r.runId = :runId")
+    int setShardTotal(@Param("runId") String runId, @Param("shardTotal") int shardTotal);
+
     /** 软取消标记（T27/D-18），不触碰 status。 */
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskRun r SET r.cancelRequestedAt = :ts WHERE r.runId = :runId")
@@ -104,6 +109,11 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
     @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'VALIDATED' "
             + "AND r.updatedAt < :cutoff")
     List<EtlTaskRun> findValidatedStuck(@Param("cutoff") Date cutoff);
+
+    /** CREATED 且驻留早于 cutoff（校验链未走完，T31 重放；以 updated_at 作为创建时间代理）。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'CREATED' "
+            + "AND r.updatedAt < :cutoff")
+    List<EtlTaskRun> findCreatedStuck(@Param("cutoff") Date cutoff);
 
     /** RUNNING 且最近心跳早于 cutoff（卡死候选，T13；最终由 SweeperPolicy 叠 checkpoint 活动精判）。 */
     @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'RUNNING' "

@@ -52,6 +52,14 @@ public class EtlTaskCheckpoint {
     @Column(name = "last_pk", length = 128)
     private String lastPk;
 
+    /** JDBC 分片主键闭区间下界，validate/T2 落库时由编排器写入；worker 只读（供 pump 派工，§7.2）。 */
+    @Column(name = "pk_from")
+    private Long pkFrom;
+
+    /** JDBC 分片主键闭区间上界（非 JDBC 源可为空）。 */
+    @Column(name = "pk_to")
+    private Long pkTo;
+
     @Column(name = "rows_in", nullable = false)
     private Long rowsIn;
 
@@ -79,10 +87,20 @@ public class EtlTaskCheckpoint {
 
     /** T2 校验通过后批量生成的分片计划行（{@link EtlShardStatus#PENDING}）。 */
     public static EtlTaskCheckpoint newPending(String taskId, String runId, String shardId) {
+        return newPending(taskId, runId, shardId, null, null);
+    }
+
+    /**
+     * T2 校验通过后批量生成的 PENDING 分片行，携带 JDBC 主键闭区间
+     * （{@code [pkFrom, pkTo]}，供 {@code DispatchService.pump} 派工时回填，§7.2）。
+     */
+    public static EtlTaskCheckpoint newPending(String taskId, String runId, String shardId, Long pkFrom, Long pkTo) {
         EtlTaskCheckpoint c = new EtlTaskCheckpoint();
         c.taskId = taskId;
         c.runId = runId;
         c.shardId = shardId;
+        c.pkFrom = pkFrom;
+        c.pkTo = pkTo;
         c.status = EtlShardStatus.PENDING.name();
         c.shardAttempt = 0;
         c.rowsIn = 0L;
@@ -139,6 +157,14 @@ public class EtlTaskCheckpoint {
 
     public String getLastPk() {
         return lastPk;
+    }
+
+    public Long getPkFrom() {
+        return pkFrom;
+    }
+
+    public Long getPkTo() {
+        return pkTo;
     }
 
     public Long getRowsIn() {

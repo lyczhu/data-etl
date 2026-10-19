@@ -7,9 +7,11 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionExce
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
+import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
 import com.lawyus.dataetl.taskmanagement.orchestrator.policy.SweeperPolicy;
 import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskRunRepository;
+import com.lawyus.dataetl.taskmanagement.orchestrator.validate.RunValidator;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
@@ -22,9 +24,10 @@ import java.util.Date;
 /**
  * 受理 sweeper（§6.5，30s）：处理 CREATED/VALIDATED 的异常驻留。
  *
- * <p>本切片实现 <b>T30</b>（VALIDATED 驻留 &gt; validated-timeout 未入队 → 内部错误 FAILED）。
- * <b>T31</b>（CREATED 驻留 &gt; created-timeout 重放校验链）依赖校验链 V-1..V-4（需源库可达 / SPI 查找），
- * 与 DispatchService 一并在 Worker/SPI 接线切片落地；此处仅记 WARN，不伪造校验通过。
+ * <p><b>T30</b>：VALIDATED 驻留 &gt; validated-timeout 未入队 → 内部错误 FAILED。
+ * <b>T31</b>：CREATED 驻留 &gt; created-timeout（提交时建 run 后校验链因基础设施异常未跑完）→
+ * 重放 {@link RunValidator#validateAndQueue}（V-1..V-4），不消耗 attempt 预算。仅 {@code newWorker=true} 时有意义
+ * （否则不存在 CREATED run）。
  */
 @Component
 public class AcceptanceSweeper {
@@ -36,15 +39,21 @@ public class AcceptanceSweeper {
     private final EtlTaskRunRepository runRepository;
     private final OrchestratorService orchestrator;
     private final OrchestratorProperties properties;
+    private final RunValidator runValidator;
+    private final RoutingProperties routing;
 
     public AcceptanceSweeper(RedissonClient redisson,
                              EtlTaskRunRepository runRepository,
                              OrchestratorService orchestrator,
-                             OrchestratorProperties properties) {
+                             OrchestratorProperties properties,
+                             RunValidator runValidator,
+                             RoutingProperties routing) {
         this.redisson = redisson;
         this.runRepository = runRepository;
         this.orchestrator = orchestrator;
         this.properties = properties;
+        this.runValidator = runValidator;
+        this.routing = routing;
     }
 
     @Scheduled(fixedRate = 30_000)
@@ -55,6 +64,7 @@ public class AcceptanceSweeper {
         }
         try {
             Date now = new Date();
+            replayStuckCreated(now);   // T31
             Date cutoff = new Date(now.getTime() - properties.getValidatedTimeout().toMillis());
             for (EtlTaskRun run : runRepository.findValidatedStuck(cutoff)) {
                 if (!SweeperPolicy.isValidatedStuck(run.getUpdatedAt(), now, properties.getValidatedTimeout())) {
@@ -75,6 +85,22 @@ public class AcceptanceSweeper {
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
+            }
+        }
+    }
+
+    /** T31：重放 CREATED 驻留 run 的校验链（不消耗 attempt 预算）。 */
+    private void replayStuckCreated(Date now) {
+        if (!routing.isNewWorker()) {
+            return;
+        }
+        Date cutoff = new Date(now.getTime() - properties.getCreatedTimeout().toMillis());
+        for (EtlTaskRun run : runRepository.findCreatedStuck(cutoff)) {
+            log.info("AcceptanceSweeper T31 replay validate run={} (CREATED stuck)", run.getRunId());
+            try {
+                runValidator.validateAndQueue(run.getTaskId(), run.getRunId());
+            } catch (RuntimeException e) {
+                log.warn("AcceptanceSweeper T31 replay failed run={}: {}", run.getRunId(), e.getMessage());
             }
         }
     }

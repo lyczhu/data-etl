@@ -18,6 +18,8 @@ public class DispatchProperties {
     private int maxConcurrentShards = 24;
     /** 单任务分片总数上限（超出为配置错误，T2 guard V-4）。 */
     private int shardMaxTotal = 5000;
+    /** 每分片目标行数（JDBC 主键区间分片的 chunk 大小，§5.2 默认 5000）。 */
+    private int shardChunkSize = 5000;
 
     public int getPumpBatch() {
         return pumpBatch;
@@ -49,5 +51,13 @@ public class DispatchProperties {
 
     public void setShardMaxTotal(int shardMaxTotal) {
         this.shardMaxTotal = shardMaxTotal;
+    }
+
+    public int getShardChunkSize() {
+        return shardChunkSize;
+    }
+
+    public void setShardChunkSize(int shardChunkSize) {
+        this.shardChunkSize = shardChunkSize;
     }
 }

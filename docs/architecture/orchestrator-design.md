@@ -159,6 +159,8 @@ CREATE TABLE IF NOT EXISTS etl_task_checkpoint (
     shard_attempt INT         NOT NULL DEFAULT 0,           -- 分片级重试次数（与 run.attempt_no 解耦，D-11）
     last_cursor   TEXT,                                     -- JDBC: pk 上界；Mongo: _id；File: 行区间+offset；Stream: topic-partition:offset
     last_pk       VARCHAR(128),
+    pk_from       BIGINT,                                   -- 分片主键闭区间下界（validate/T2 由编排器写入，供 §7.2 派工）
+    pk_to         BIGINT,                                   -- 分片主键闭区间上界（非 JDBC 源可空）
     rows_in       BIGINT      NOT NULL DEFAULT 0,           -- 累计单调不减（D-08）
     rows_out      BIGINT      NOT NULL DEFAULT 0,
     rows_dropped  BIGINT      NOT NULL DEFAULT 0,
@@ -434,6 +436,8 @@ DispatchService.pump()   每 5s（与 BackoffReleaseSweeper 同调度器）
 ```
 
 派工消息体**只带游标区间不带数据行**（对齐方案 §5.2）；全局令牌桶上限 `etl.dispatch.max-concurrent-shards`（默认 `cpu*2*实例数` 量级，Phase 1 用静态配置 24），护住源库（方案 §5.4）。
+
+> 分片主键区间（`pkFrom/pkTo`）在 validate/T2 生成计划时由编排器持久化进 `etl_task_checkpoint.pk_from/pk_to`（§4.2），`pump` 直接读取回填派工消息，避免每次派工重连源库重算；worker 对该两列只读。
 
 ### 7.3 心跳与进度（`DISPATCHED → RUNNING`）
 
