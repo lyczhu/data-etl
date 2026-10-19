@@ -15,6 +15,9 @@
 
     <properties>
         <redisson.version>3.52.0</redisson.version>
+        <!-- 集成测试（§12.1，需真实 PG/Kafka/Redis）按 JUnit 5 tag "it" 标记；默认排除，使 mvn test 无需基础设施即可跑绿。
+             打开方式：mvn -pl task-management-service -am test -Pit -->
+        <it.excludedGroups>it</it.excludedGroups>
     </properties>
 
     <dependencies>
@@ -83,10 +86,32 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- §12.1 集成测试：真实 Kafka 往返后等待异步收敛（awaitility 版本由 BOM 管理） -->
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- §12.1 全链路 E2E：把真实 etl-worker 的 Spring 上下文起在同一 JVM，消费 orchestrator 的派工消息 -->
+        <dependency>
+            <groupId>com.lawyus</groupId>
+            <artifactId>etl-worker</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <!-- 排除 "it" tag：集成测试依赖 docker-compose 的 PG/Kafka/Redis，不进默认 test 阶段 -->
+                    <excludedGroups>${it.excludedGroups}</excludedGroups>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
@@ -148,4 +173,30 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- mvn -pl task-management-service -am test -Pit ：放开 "it" tag 并把 *IT 纳入 surefire 默认 includes，
+             单元测 + §12.1 集成测一起跑（需真实 PG/Kafka/Redis；缺失时用例自动 skip 而非 fail） -->
+        <profile>
+            <id>it</id>
+            <properties>
+                <it.excludedGroups/>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <configuration>
+                            <includes>
+                                <include>**/*Test.java</include>
+                                <include>**/*IT.java</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

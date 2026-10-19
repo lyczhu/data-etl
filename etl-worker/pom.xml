@@ -76,6 +76,9 @@
                 <configuration>
                     <mainClass>com.lawyus.dataetl.worker.WorkerApplication</mainClass>
                     <executable>true</executable>
+                    <!-- 可执行 fat jar 另加 -exec 分类符：主构件保持普通 jar，
+                         以便 task-management-service 的 §12.1 E2E 集成测试以 test scope 依赖 worker 类 -->
+                    <classifier>exec</classifier>
                 </configuration>
             </plugin>
         </plugins>

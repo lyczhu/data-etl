@@ -9,6 +9,13 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
 - Focused module (parent reactor must be built too, so keep `-am`):
   `mvn -pl task-management-service -am clean test`
 - Full suite: `mvn test` — this is the verification gate every slice must pass before it is considered done.
+- Integration tests (`orchestrator-design.md` §12.1) live in `task-management-service/src/test/java/.../it/`, are tagged `it`, and are **excluded** from `mvn test`.
+  Run them with `mvn -pl task-management-service -am test -Pit` (or `-Dtest=*IT` for only the ITs). They need
+  `docker compose up -d postgres redis kafka`; when infra is absent the cases **skip, not fail**. They use a dedicated
+  database `etl_it` (auto-created, schema applied from `db/schema/02|05|06`) and per-JVM Kafka topic names, so they never
+  touch the `etl_system` database used by the e2e runbook.
+- `FullChainE2EIT` boots the real `etl-worker` Spring context in the same test JVM (test-scope dependency on `etl-worker`);
+  that is why its repackage goal publishes an `-exec` classifier jar and keeps the plain jar as the main artifact.
 - Java target is **17** (`pom.xml` → `<java.version>` / `<maven.compiler.release>`). `README.md` "JDK 11+" is stale;
   trust the parent pom. Records and `switch` expressions are used in production code.
 - Before repackaging, stop any JVM still holding `target/*.jar`, otherwise `spring-boot:repackage` silently produces a
@@ -35,9 +42,8 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
 
 ## Repository boundaries
 
-- `docs/` and `e2e-logs/` are gitignored (`.gitignore` lines 68 and 46). Architecture docs, `.dot`, and `.svg` are
-  **local-only and never committed** — do not `git add -f` them or expect them in a PR. Only code, `db/schema/*.sql`,
-  `pom.xml`, and config under `config-server` are versioned.
+- `e2e-logs/` is gitignored (run logs, local-only). `docs/` **is** versioned since 2026-10 — architecture docs, `.dot`,
+  and `.svg` are meant to land in PRs together with the code they describe.
 - Diagram rendering: Graphviz is not on PATH. Regenerate the SVG whenever a `.dot` changes:
   `& 'D:\Programs\Graphviz\bin\dot.exe' -Tsvg target-lifecycle-states.dot -o target-lifecycle-states.svg`
 - A service that ships its own `logback-spring.xml` **ignores** `logging.pattern.*` from `application.yml` / config-repo;
@@ -55,6 +61,11 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
 - Storage batch consumer (`data-storage-service`): a batch listener must **record-and-skip** unparseable messages (Poison
   Guard) and must never throw to retry the whole batch — that causes an infinite poison loop. Real DLT isolation is a
   later phase.
+- Kafka listeners are **not** transactional. Any Spring Data `@Modifying` query they call therefore needs `@Transactional`
+  on the repository method itself (`EtlTaskRunRepository.touchProgress`, `EtlTaskCheckpointRepository.touch`); without it
+  the update throws `TransactionRequiredException`, which escapes the listener and re-triggers delivery forever.
+- `attempt_no` restarts at 1 for every new run (§5.1 T1 / D-22). `ux_run_task_attempt` is a **partial** index
+  (`WHERE is_current`) for exactly that reason — do not make `attempt_no` task-monotonic to "fix" a duplicate-key error.
 
 ## Toolchain
 

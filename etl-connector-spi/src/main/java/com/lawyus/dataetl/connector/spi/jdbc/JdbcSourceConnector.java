@@ -190,7 +190,10 @@ public class JdbcSourceConnector implements SourceConnector {
                 for (int i = 1; i <= cols; i++) {
                     values.put(md.getColumnLabel(i), rs.getObject(i));
                 }
-                nextCached = false;
+                // 本行已消费：置 null 让下一次 hasNext() 重新 rs.next() 前移游标。
+                // 置 false 会把 hasNext() 永久卡在 false 上 —— 每个分片只读得到 1 行
+                // （§12.1 全链路 E2E 跑真表时暴露）。
+                nextCached = null;
                 return new SourceRecord(shardId, rs.getObject(pk), values);
             } catch (SQLException e) {
                 throw new RuntimeException(e);

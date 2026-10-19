@@ -46,9 +46,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_run_task_current
     ON etl_task_run (task_id)
     WHERE is_current AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','SUPERSEDED');
 
--- INV-7：同一 task 的 attempt_no 唯一（防并发双自增）
+-- INV-7：同一 task 的「当前 run」内 attempt_no 唯一（防并发双自增）。
+-- 必须带 WHERE is_current：§5.1 T1 明确「新建 run 归 1」（D-22），同一 task 的历史（已归档）run
+-- 允许重复的 attempt_no；若无此谓词，第二次 submit 会直接撞唯一键（§12.1 集成测试-真库暴露）。
+-- 上一版定义（无 WHERE）与本脚本不一致，故先 DROP 再建；该索引仅作约束，重建不损数据。
+DROP INDEX IF EXISTS ux_run_task_attempt;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_run_task_attempt
-    ON etl_task_run (task_id, attempt_no);
+    ON etl_task_run (task_id, attempt_no)
+    WHERE is_current;
 
 CREATE INDEX IF NOT EXISTS idx_run_status_progress ON etl_task_run (status, last_progress_ts);
 CREATE INDEX IF NOT EXISTS idx_run_dispatched ON etl_task_run (status, dispatched_at);

@@ -141,7 +141,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_run_task_current
     ON etl_task_run (task_id)
     WHERE is_current AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','SUPERSEDED');
 CREATE UNIQUE INDEX IF NOT EXISTS ux_run_task_attempt
-    ON etl_task_run (task_id, attempt_no);
+    ON etl_task_run (task_id, attempt_no)
+    WHERE is_current;   -- 仅限当前 run：T1「新建 run 归 1」意味着历史 run 之间 attempt_no 必然重复
 CREATE INDEX IF NOT EXISTS idx_run_status_progress ON etl_task_run (status, last_progress_ts);
 CREATE INDEX IF NOT EXISTS idx_run_dispatched ON etl_task_run (status, dispatched_at);
 ```
@@ -263,7 +264,7 @@ stateDiagram-v2
 | INV-4 | `SUCCEEDED` 的 run 必然 `rows_out + rows_dropped = rows_in` | G-4 前置 + §12.2 校验 SQL（校验 2） |
 | INV-5 | `RETRYING` 期间不存在 `ASSIGNED/RUNNING` shard | quiesce guard（T12/T21）+ sweeper 复核 |
 | INV-6 | `etl_task.status` 恒等于 current run 的 status | 只经 `refreshDerivedStatus()` 写；§12.2 校验 SQL（校验 1） |
-| INV-7 | `attempt_no` 单调不减，且自动重试次数 ≤ `maxAttempts(=3)` | `ux_run_task_attempt` + guard；人工 `/retry` `/resume` 不计入（§7.8） |
+| INV-7 | `attempt_no` 单调不减，且自动重试次数 ≤ `maxAttempts(=3)` | `ux_run_task_attempt`（**部分索引，仅 `is_current`**；否则与 T1「新建 run 归 1」冲突）+ guard；人工 `/retry` `/resume` 不计入（§7.8） |
 | INV-8 | `NEEDS_ATTENTION` 只能由 T9/T13/T18/T22/T32 **进入**，且进入时必然已有 DLT 行或 `error_summary` | 迁移表 + audit 必填 |
 | INV-9 | 每个状态变更（含人工）必有且仅有一条 `etl_task_audit` | 同事务写 |
 | INV-10 | 终态 run 的 `updated_at` 只能因 T28/T29（`→ SUPERSEDED`）而晚于 `finished_at` | §12.2 校验 3 |
@@ -849,6 +850,34 @@ rg -n "setStatus\(" task-management-service/src | rg -v "EtlTaskService.java|orc
 | DLT 死循环 | `NEEDS_ATTENTION` 带未 `resolved` 的 DLT 执行 `/retry` | 必须同事务标 `resolved`；收敛不再立即回到 `NEEDS_ATTENTION`（§7.6） |
 | 时间推进 | 退避 5m/15m/1h 与四个超时阈值用可注入 `Clock` 测 | `next_attempt_at` 精确命中；attempt 耗尽走 T22 |
 | 非法迁移不重试 | 向 `results` 投递非法消息 | 消费位点正常前进（无 poison loop）+ 进 DLT + `illegal` 计数 +1 |
+
+#### 12.1.1 实现状况（2026-10，`task-management-service/src/test/java/.../it/`）
+
+真 PostgreSQL（自建的 `etl_it` 库）+ 真 Kafka + 真 Redis，起完整应用上下文；由 JUnit tag `it` 门控，
+跑法：`mvn -pl task-management-service -am test -Pit`（39 个用例；不带 `-Pit` 时 `mvn test` 不碰基础设施）。
+
+| 矩阵行 | 承载用例 | 状态 |
+|---|---|---|
+| 穷举迁移 144 | `OrchestratorStateMachineIT.allOneHundredFortyFourCombinations_exactlyThirtyTwoLegal` | ✅ 恰 32 条通过，余 112 条抛异常且库不变 |
+| 终态保护 | 同上类 `terminalStates_onlySuperseededIsLegal` / `needsAttentionCannotBeWhitewashedIntoSucceeded` | ✅ |
+| G-4 对账 | `ConvergenceGuardIT.rowImbalanceBlocksSuccessAndRoutesNeedsAttention` | ✅ 含 `guard=BALANCE` 计数断言 |
+| dedup 跳 attempt | `ConvergenceGuardIT.dedupAcrossAttemptKeepsBalanceAndReachesSuccess` | ✅ |
+| quiesce | `ConvergenceGuardIT.quiesceBlocksRetryingAndConvergesToPartialSuccess` | ✅ |
+| CAS 并发 | `OrchestratorStateMachineIT.casRace_tenThreadsExactlyOneTransitionWins` | ✅ 恰一次成功；另含 INV-1/INV-6/INV-7 真索引用例 |
+| 心跳丢失但在跑 | `SweeperIT.heartbeatLostButShardActive_recoversRunning` | ✅ 补登记 RUNNING，不消耗 attempt |
+| 取消不可达 | `SweeperIT.cancelAckTimeoutWithoutActiveShard_forcesCancelled`（+ 有活跃分片不强制的反例） | ⚠️ 直接种 `cancel_requested_at`；§9 的 `POST /cancel` API 尚未实现，所以“发 /cancel”这一步只能在用例里等价模拟 |
+| DLT 死循环 | — | ❌ 不能 IT：需 §9 `/retry` API + Phase 2 `07-etl-task-dlt.sql` 的 `resolved` 回写；已实现的两半（行级毒→`NEEDS_ATTENTION`、协议类毒不改状态）由 `KafkaDataPlaneIT` 真 broker 覆盖 |
+| 时间推进 | `SweeperIT.backoffSchedule_isExactFromConfiguredTiers`（t0+5m 精确）+ T8/T9/T21/T30/T31/T32 各用例 | ✅ attempt 耗尽走 T9/T22 均有断言 |
+| 非法消息不重试 | `KafkaDataPlaneIT.poisonPayload_doesNotStallTheContainer` | ✅ 断言消费位点真前移（AdminClient 读 committed offset） |
+
+未写在那张表里、但属于新链路核心的额外覆盖：入口链 V-1..V-4 与派工契约（`EntryChainIT`）、
+§7.3/§7.5/§7.6 三个监听器的真 broker 往返（`KafkaDataPlaneIT`）、以及含真 `etl-worker` 进度的
+全链路 E2E + §12.2 四条一致性 SQL（`FullChainE2EIT`）。
+
+> **集成测试跑出的三个真缺陷（已修）**：
+> 1. `ux_run_task_attempt(task_id, attempt_no)` 全局唯一与 T1「新建 run 归 1」直接矛盾 —— 第二次 submit 必撞唯一键；已改为仅约束 `is_current` 的部分索引（见 §4.2/INV-7）。
+> 2. `ProgressListener` 的心跳写在事务之外（`@Modifying` 抛 `TransactionRequiredException`）且异常外抛导致 Kafka 反复重投同一心跳；已在 `touchProgress`/`touch` 两个仓储方法上自带 `@Transactional`。
+> 3. `JdbcSourceConnector.ResultSetCursor.next()` 把 `nextCached` 置 `false` 而非 `null`，导致每个分片只读到 1 行：目标表严重缺数，但 run 仍能收敛 `SUCCEEDED`（对账等式按实际读数算）——只有真库 E2E 能抓住。
 
 ### 12.2 nightly 一致性校验（INV 守门，对应方案 §7.3-C）
 

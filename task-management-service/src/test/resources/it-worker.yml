@@ -1,0 +1,52 @@
+# ============================================================================
+# it-worker.yml —— §12.1 全链路 E2E 里真实 etl-worker 上下文的配置
+#
+# FullChainE2EIT 用 SpringApplicationBuilder(WorkerApplication.class) 在**同一 JVM** 起一个真 worker，
+# 并以 --spring.config.location=classpath:/it-worker.yml 完全替换 worker 自带的 application.yml
+# （否则会与 task-management-service 的 application.yml 在 classpath 根冲突）。
+# topic 名、数据源 url、Kafka 地址由测试以 --key=value 命令行参数注入（优先级最高，且能与
+# orchestrator 侧 @DynamicPropertySource 的"每 JVM 唯一 topic"保持一致）。
+# ============================================================================
+spring:
+  main:
+    banner-mode: 'off'
+  application:
+    name: etl-worker-it
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    username: postgres
+    password: postgres
+  kafka:
+    consumer:
+      group-id: it-etl-worker
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+server:
+  port: 0
+
+eureka:
+  client:
+    enabled: false
+    register-with-eureka: false
+    fetch-registry: false
+
+etl:
+  worker:
+    chunk-size: 5                # 20 行源表分 4 个 chunk 提交，覆盖"每 chunk 落一次 checkpoint"
+    fetch-size: 500
+    max-shards: 5000
+    progress-interval-ms: 200
+    transform-profile: JDBC
+    number-scale: 2
+    keep-columns: []
+
+logging:
+  level:
+    root: WARN
+    com.lawyus: INFO
+    org.apache.kafka: ERROR

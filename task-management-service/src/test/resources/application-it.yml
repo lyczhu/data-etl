@@ -1,0 +1,96 @@
+# ============================================================================
+# application-it.yml —— §12.1 集成测试（真 PostgreSQL + 真 Kafka + 真 Redis）
+#
+# 由 @ActiveProfiles("it") 激活；基础设施坐标与 ItInfra 保持一致（docker-compose 的
+# postgres:5433 / kafka:9092 / redis:6379）。库指向 IT 专用库 etl_it（ItInfra 自建），
+# topic 由 @DynamicPropertySource 注入为"每次 JVM 运行唯一"的名字，避免与现网 e2e 及历史
+# 运行残留互相干扰。
+#
+# 关键：所有 sweeper 超时阈值调成 100d —— @SpringBootTest 起的是真实上下文，
+# @EnableScheduling 的四个 sweeper 与 pump 会按 15/30/5s 周期真的跑；阈值放大后它们
+# 在测试期间一律"不命中"，需要验证 sweeper 行为时由测试用例临时改小并直接调用 sweep()。
+# ============================================================================
+spring:
+  main:
+    banner-mode: 'off'
+  cloud:
+    config:
+      enabled: false
+    discovery:
+      enabled: false
+    service-registry:
+      auto-registration:
+        enabled: false
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    username: postgres
+    password: postgres
+    url: jdbc:postgresql://localhost:5433/etl_it
+  jpa:
+    hibernate:
+      ddl-auto: update          # 表由 db/schema 02/05/06 建（含部分唯一索引/CHECK），此处仅补实体差异列
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: task-management-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+  redis:
+    host: localhost
+    port: 6379
+
+eureka:
+  client:
+    enabled: false
+    register-with-eureka: false
+    fetch-registry: false
+  instance:
+    instance-id: it-task-management
+
+etl:
+  topics:
+    task-request: it.task.request
+    task-completed: it.task.completed
+    task-failed: it.task.failed
+    dispatch-batch: it.etl.task.dispatch.batch
+    progress: it.etl.task.progress
+    results: it.etl.task.results
+    dlt: it.etl.task.dlt
+    commands: it.etl.task.commands
+  orchestrator:
+    max-attempts: 3
+    dispatch-heartbeat-timeout: 100d
+    cancel-ack-timeout: 100d
+    scheduled-starvation-timeout: 100d
+    throttled-starvation-timeout: 100d
+    partial-success-retention: 100d
+    needs-attention-escalation: 100d
+    created-timeout: 100d
+    validated-timeout: 100d
+    stall-fallback-threshold: 100d
+    backoff-task-attempts: [5m, 15m, 1h]   # 与生产默认一致：§12.1"退避精确命中"断言依赖这三档
+  dispatch:
+    pump-batch: 50
+    permits-per-run: 8
+    max-concurrent-shards: 24
+    shard-max-total: 5000
+    shard-chunk-size: 8          # IT 源表 20 行 → 3 个分片，覆盖多分片收敛
+  routing:
+    new-worker: false            # 用例内按需翻转，@AfterEach 复原
+    shadow-compare: false
+
+logging:
+  level:
+    root: WARN
+    com.lawyus: INFO
+    org.springframework: WARN
+    org.apache.kafka: ERROR
+    org.hibernate: WARN

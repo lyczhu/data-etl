@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Date;
 import java.util.List;
@@ -52,7 +53,13 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
     @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c WHERE c.runId = :runId")
     Date maxUpdatedAt(@Param("runId") String runId);
 
-    /** progress 心跳仅刷新 updated_at，不改 shard 状态（§7.3）。 */
+    /**
+     * progress 心跳仅刷新 updated_at，不改 shard 状态（§7.3）。
+     *
+     * <p>与 {@code EtlTaskRunRepository#touchProgress} 同理：调用方（ProgressListener）不在事务内，
+     * 必须自带 {@code @Transactional}，否则 {@code @Modifying} 抛 {@code TransactionRequiredException}。
+     */
+    @Transactional
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskCheckpoint c SET c.updatedAt = :ts "
             + "WHERE c.runId = :runId AND c.shardId = :shardId")

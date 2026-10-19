@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Date;
 import java.util.List;
@@ -38,7 +39,14 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
             + "WHERE r.runId = :runId AND r.status = :from")
     int casStatus(@Param("runId") String runId, @Param("from") String from, @Param("to") String to);
 
-    /** 心跳/进度基线单调更新（T7、§7.3）：只在更新更晚的时间戳时写入。 */
+    /**
+     * 心跳/进度基线单调更新（T7、§7.3）：只在更新更晚的时间戳时写入。
+     *
+     * <p>自带写事务：{@code ProgressListener} 的心跳落点在事务之外（有意保持监听器不做长事务），
+     * 若不加 {@code @Transactional} 则 {@code @Modifying} 直接抛 {@code TransactionRequiredException}，
+     * 心跳一条都写不进去（§12.1 集成测试暴露）。
+     */
+    @Transactional
     @Modifying(clearAutomatically = true)
     @Query("UPDATE EtlTaskRun r SET r.lastProgressTs = :ts "
             + "WHERE r.runId = :runId AND (r.lastProgressTs IS NULL OR r.lastProgressTs < :ts)")
