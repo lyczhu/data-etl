@@ -23,13 +23,36 @@ class JdbcSinkWriterSqlTest {
     }
 
     @Test
-    @DisplayName("buildCreateTable 沿用源列类型 + IF NOT EXISTS")
+    @DisplayName("buildCreateTable 映射目标类型并强制 idempotency_key 主键")
     void buildCreateTable() {
         TableSchema schema = new TableSchema("t_dest", List.of(
                 new ColumnDef("id", "int4", java.sql.Types.INTEGER, 0, false),
                 new ColumnDef("name", "varchar", java.sql.Types.VARCHAR, 100, true)));
         assertThat(writer.buildCreateTable(schema))
-                .isEqualTo("CREATE TABLE IF NOT EXISTS t_dest (id int4, name varchar)");
+                .isEqualTo("CREATE TABLE IF NOT EXISTS t_dest (id integer, name varchar(100), "
+                        + "idempotency_key VARCHAR(64) PRIMARY KEY)");
+    }
+
+    @Test
+    @DisplayName("buildUpsert 带 idempotency_key 时 PG 追加 ON CONFLICT DO NOTHING")
+    void buildPostgresUpsert() {
+        TableSchema schema = new TableSchema("t_dest", List.of(
+                new ColumnDef("id", "int4", java.sql.Types.INTEGER, 0, false),
+                new ColumnDef("idempotency_key", "varchar", java.sql.Types.VARCHAR, 64, false)));
+        assertThat(writer.buildUpsert(schema, List.of("id", "idempotency_key")))
+                .isEqualTo("INSERT INTO t_dest (id, idempotency_key) VALUES (?, ?) "
+                        + "ON CONFLICT (idempotency_key) DO NOTHING");
+    }
+
+    @Test
+    @DisplayName("buildUpsert 对几何列使用 ST_GeomFromEWKT")
+    void buildGeometryUpsert() {
+        TableSchema schema = new TableSchema("t_dest", List.of(
+                new ColumnDef("geom", "geometry", java.sql.Types.OTHER, 0, true),
+                new ColumnDef("idempotency_key", "varchar", java.sql.Types.VARCHAR, 64, false)));
+        assertThat(writer.buildUpsert(schema, List.of("geom", "idempotency_key")))
+                .isEqualTo("INSERT INTO t_dest (geom, idempotency_key) "
+                        + "VALUES (ST_GeomFromEWKT(?), ?) ON CONFLICT (idempotency_key) DO NOTHING");
     }
 
     @Test
@@ -40,11 +63,13 @@ class JdbcSinkWriterSqlTest {
     }
 
     @Test
-    @DisplayName("SinkResult.combine 累加三个计数")
+    @DisplayName("SinkResult 分账：filtered/failed 都计入 rowsDropped，但失败另计")
     void combine() {
         SinkResult r = new SinkResult(3, 1, 2).combine(new SinkResult(4, 0, 5));
         assertThat(r).isEqualTo(new SinkResult(7, 1, 7));
-        assertThat(new SinkResult(1, 1, 1).rowsOut() + new SinkResult(1, 1, 1).rowsDropped())
-                .isEqualTo(2);
+        SinkResult explicit = new SinkResult(5, 2, 1, 3, List.of());
+        assertThat(explicit.rowsDropped()).isEqualTo(3);
+        assertThat(explicit.rowsFailed()).isEqualTo(1);
+        assertThat(explicit.rowsDeduped()).isEqualTo(3);
     }
 }

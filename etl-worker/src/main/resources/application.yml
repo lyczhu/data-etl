@@ -45,6 +45,12 @@ eureka:
   instance:
     prefer-ip-address: true
 
+data:
+  source:
+    service:
+      # WP-06：worker 用 dataSourceId 向 data-source-service 换取运行时连接信息，消息面不再带明文口令
+      url: http://localhost:8081
+
 etl:
   topics:
     dispatch-batch: etl.task.dispatch.batch
@@ -57,8 +63,15 @@ etl:
     max-shards: 5000
     progress-interval-ms: 5000
     transform-profile: JDBC   # JDBC|CSV|JSON|MONGO|GEOJSON；决定默认转换规则链
-    number-scale: 2
+    # WP-07：<0 = 不做默认数值截断；任务显式配置精度时才启用
+    number-scale: -1
     keep-columns: []          # 非空则前置字段裁剪 + snake_case 归一
+    # WP-05：分片内瞬态错误重试与退避
+    shard-max-retries: 3
+    retry-backoff-ms: 1000
+    # WP-02：同库部署时目标写入 + checkpoint + DLT 同事务；跨库自动退化为幂等重放
+    same-database-transaction: true
+    lease-seconds: 120
 
 management:
   endpoints:

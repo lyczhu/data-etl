@@ -1,13 +1,19 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator;
 
 /**
- * 收敛判定纯函数（{@code orchestrator-design.md §7.5}）：results 消息只是触发器，终局一律依 checkpoint 聚合重算（P1/D-16）。
+ * 收敛判定纯函数（{@code orchestrator-design.md §7.5} + 方案 v2 WP-04/WP-10）。
  *
- * <p>输入是当前 run 的 {@link RunAggregate}（worker 直写的 checkpoint 分桶）、{@code shardTotal} 与
+ * <p>results 消息只是触发器，终局一律依 checkpoint 聚合重算（P1/D-16）。
+ * 输入是当前 run 的 {@link RunAggregate}（worker 直写的 checkpoint 分桶）、{@code shardTotal} 与
  * {@code cancelRequested} 标志；输出应为哪个 run 级迁移。不含任何 DB/消息依赖，纯静态、可单测。
  *
- * <p>与 guard 命名对齐：{@link Outcome#SUCCEEDED} 对应 T10（G-4 BALANCE 前置在此判平，不平转
- * {@link Outcome#NEEDS_ATTENTION_BALANCE}）；{@link Outcome#PARTIAL_SUCCESS} 对应 T11（G-2）。
+ * <p>v2 修正：
+ * <ul>
+ *   <li>{@code SUCCEEDED} 要求 {@code rows_failed == 0} 且对账平衡（坏行不得静默判成功）；</li>
+ *   <li>{@code PARTIAL_SUCCESS} 要求 {@code succeeded+failed+skipped == shard_total}（G-2 总和校验）；</li>
+ *   <li>{@code rows_filtered} 与 {@code rows_deduped} 都参与对账；后者覆盖“目标已提交、checkpoint
+ *       未写”的崩溃重放（同一批行被重读且全部幂等命中）。</li>
+ * </ul>
  */
 public final class ConvergencePolicy {
 
@@ -44,16 +50,15 @@ public final class ConvergencePolicy {
             return Outcome.FAILED;
         }
         if (succeeded == shardTotal && failed == 0 && skipped == 0) {
-            long rowsOut = nz(a.getRowsOut());
-            long rowsDropped = nz(a.getRowsDropped());
-            long rowsIn = nz(a.getRowsIn());
-            return (rowsOut + rowsDropped == rowsIn)
+            return a.isBalanced() && a.hasNoFailedRows()
                     ? Outcome.SUCCEEDED
                     : Outcome.NEEDS_ATTENTION_BALANCE;
         }
         if (failed >= 1) {
-            // 已收敛，剩余必为 succeeded/skipped（succeeded+failed+skipped==shardTotal）
-            return Outcome.PARTIAL_SUCCESS;
+            // G-2 总和校验：已收敛时 succeeded+failed+skipped 必须等于计划分片数
+            return (succeeded + failed + skipped == shardTotal)
+                    ? Outcome.PARTIAL_SUCCESS
+                    : Outcome.NEEDS_ATTENTION_BALANCE;
         }
         // 全 SKIPPED 等无 FAILED 的异常形态：保守转人工
         return Outcome.NEEDS_ATTENTION_BALANCE;

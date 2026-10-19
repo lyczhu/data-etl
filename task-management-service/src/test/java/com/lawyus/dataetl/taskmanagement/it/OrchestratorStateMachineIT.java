@@ -51,9 +51,10 @@ class OrchestratorStateMachineIT extends AbstractOrchestratorIT {
         for (EtlTaskStatus from : EtlTaskStatus.values()) {
             for (EtlTaskStatus to : EtlTaskStatus.values()) {
                 String taskId = seedTask(ItInfra.SOURCE_TABLE, targetTableFor(from, to));
-                String runId = seedRun(taskId, from, 1, 0);
-                // G-2 前置：RUNNING → PARTIAL_SUCCESS 必须存在 FAILED 分片
-                if (from == RUNNING && to == PARTIAL_SUCCESS) {
+                // G-2 前置：RUNNING → PARTIAL_SUCCESS 必须有 FAILED 分片，且 shard_total 与之和一致
+                boolean partial = from == RUNNING && to == PARTIAL_SUCCESS;
+                String runId = seedRun(taskId, from, 1, partial ? 1 : 0);
+                if (partial) {
                     seedCheckpoint(taskId, runId, "shard-0", EtlShardStatus.FAILED, 10, 8, 2);
                 }
                 boolean legal = AllowedTransitions.isAllowed(from, to);

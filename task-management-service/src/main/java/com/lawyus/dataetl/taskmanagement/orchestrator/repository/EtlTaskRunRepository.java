@@ -172,4 +172,22 @@ public interface EtlTaskRunRepository extends JpaRepository<EtlTaskRun, Long> {
     @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status = 'QUEUED' "
             + "ORDER BY r.updatedAt ASC")
     List<EtlTaskRun> findQueuedForDispatch(Pageable pageable);
+
+    /**
+     * 全量派工（WP-01 / P0-1）：除 QUEUED 外，DISPATCHED/RUNNING 且仍有 PENDING 分片的 run
+     * 也必须继续补派；否则 30M 行任务只跑首批 permitsPerRun 片。
+     */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE "
+            + "AND r.status IN ('QUEUED','DISPATCHED','RUNNING') "
+            + "AND EXISTS (SELECT c FROM EtlTaskCheckpoint c "
+            + "            WHERE c.runId = r.runId AND c.status = 'PENDING') "
+            + "ORDER BY r.updatedAt ASC")
+    List<EtlTaskRun> findDispatchableRuns(Pageable pageable);
+
+    /** 结果丢失兜底（WP-10 / P1-1）：收敛 sweeper 扫描的活跃 run。 */
+    @Query("SELECT r FROM EtlTaskRun r WHERE r.isCurrent = TRUE AND r.status IN ('DISPATCHED','RUNNING')")
+    List<EtlTaskRun> findActiveRuns();
+
+    /** 程序化读取当前 run（API 用）。 */
+    Optional<EtlTaskRun> findFirstByTaskIdAndIsCurrentTrueOrderByAttemptNoDesc(String taskId);
 }

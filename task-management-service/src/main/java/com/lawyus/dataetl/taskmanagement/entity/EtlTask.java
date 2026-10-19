@@ -12,6 +12,9 @@ public class EtlTask {
 
     private String taskId;
     private Long dataSourceId;
+    /** 目标数据源（WP-03/D15）；为空时由 worker 写本地库（同库部署）。 */
+    @Column(name = "target_data_source_id")
+    private Long targetDataSourceId;
     private String sourceTableName;
     private String targetTableName;
     private String status;
@@ -68,6 +71,14 @@ public class EtlTask {
 
     public void setDataSourceId(Long dataSourceId) {
         this.dataSourceId = dataSourceId;
+    }
+
+    public Long getTargetDataSourceId() {
+        return targetDataSourceId;
+    }
+
+    public void setTargetDataSourceId(Long targetDataSourceId) {
+        this.targetDataSourceId = targetDataSourceId;
     }
 
     public String getSourceTableName() {

@@ -18,6 +18,8 @@ spring:
     password: postgres
   kafka:
     consumer:
+      # @KafkaListener 的 groupId 实际读 etl.worker.consumer-group（IT 启动参数注入每次 JVM 唯一的组名）；
+      # 这里的 group-id 仅作 Boot 自动装配的默认值，避免与本地运行中的 e2e worker 混组。
       group-id: it-etl-worker
       auto-offset-reset: earliest
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
@@ -42,8 +44,17 @@ etl:
     max-shards: 5000
     progress-interval-ms: 200
     transform-profile: JDBC
-    number-scale: 2
+    number-scale: -1             # WP-07：不默认 setScale(2)
     keep-columns: []
+    same-database-transaction: true   # WP-02：源/目标/checkpoint 同库时同事务
+    shard-max-retries: 1
+    retry-backoff-ms: 50
+    lease-seconds: 30
+
+data:
+  source:
+    service:
+      url: http://localhost:8081
 
 logging:
   level:

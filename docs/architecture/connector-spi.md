@@ -35,7 +35,7 @@ public interface SinkWriter {
 ```
 
 - `Shard` 只带游标区间（JDBC：`pkFrom/pkTo` 闭区间；其它：`cursorFrom/cursorTo` + `resumeCursor`）——派工消息不带数据行（§5.2）。
-- `SinkResult{rowsOut, rowsDropped, rowsDeduped}`：对账等式 `rowsOut + rowsDropped = rowsIn`，`rowsDeduped` 不入等式（D-08）。
+- `SinkResult{rowsOut, rowsDropped, rowsDeduped}`：对账等式 `rowsOut + rowsFiltered + rowsFailed + rowsDeduped = rowsIn`（崩溃重放会再次读入 rowsIn，必须计入幂等命中）。
 
 ## JDBC 参考实现要点
 

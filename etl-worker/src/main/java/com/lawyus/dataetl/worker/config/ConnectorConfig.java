@@ -10,6 +10,8 @@ import com.lawyus.dataetl.worker.pipeline.RecordTransformer;
 import com.lawyus.dataetl.worker.pipeline.TransformerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
 
@@ -19,6 +21,12 @@ import javax.sql.DataSource;
  */
 @Configuration
 public class ConnectorConfig {
+
+    /** WP-02：让“目标写入 + checkpoint + DLT”共享 worker 本地 DataSource 的同一个事务。 */
+    @Bean
+    public TransactionTemplate transactionTemplate(PlatformTransactionManager transactionManager) {
+        return new TransactionTemplate(transactionManager);
+    }
 
     @Bean
     public ConnectorRegistry connectorRegistry(DataSource dataSource) {

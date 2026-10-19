@@ -16,18 +16,36 @@ public final class ShardRanges {
     }
 
     /**
+     * 旧口径：按 chunkSize 切分（一片 ≈ 一个 chunk）。保留用于兼容测试与历史调用。
+     *
      * @return 每个元素为 {@code long[]{from, to}}（闭区间，from&lt;=to）；{@code maxPk<minPk} 时返回空列表。
      */
     public static List<long[]> split(long minPk, long maxPk, int chunkSize, int maxShards) {
-        List<long[]> ranges = new ArrayList<>();
         if (maxPk < minPk) {
-            return ranges;
+            return new ArrayList<>();
         }
         int chunk = Math.max(1, chunkSize);
-        int cap = Math.max(1, maxShards);
         long span = maxPk - minPk + 1;
         long byChunk = (span + chunk - 1) / chunk;            // ceil(span/chunk)
-        int numShards = (int) Math.min(cap, Math.max(1, byChunk));
+        return splitByCount(minPk, maxPk, byChunk, maxShards);
+    }
+
+    /**
+     * 方案 v2 D4：分片数 = 并行单元（{@code desiredShards}），chunk 只做分片内事务单元。
+     * 30M 行不再产生 6000 个分片，默认 16 片覆盖全区间。
+     */
+    public static List<long[]> splitByParallelism(long minPk, long maxPk, int desiredShards, int maxShards) {
+        if (maxPk < minPk) {
+            return new ArrayList<>();
+        }
+        return splitByCount(minPk, maxPk, Math.max(1, desiredShards), maxShards);
+    }
+
+    private static List<long[]> splitByCount(long minPk, long maxPk, long wanted, int maxShards) {
+        List<long[]> ranges = new ArrayList<>();
+        int cap = Math.max(1, maxShards);
+        long span = maxPk - minPk + 1;
+        int numShards = (int) Math.min(cap, Math.max(1, wanted));
         long step = (span + numShards - 1) / numShards;        // ceil(span/numShards)
         for (long from = minPk; from <= maxPk; ) {
             long to = Math.min(from + step - 1, maxPk);

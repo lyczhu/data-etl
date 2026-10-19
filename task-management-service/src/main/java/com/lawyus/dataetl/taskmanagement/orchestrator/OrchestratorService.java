@@ -5,6 +5,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorPropert
 import com.lawyus.dataetl.taskmanagement.orchestrator.event.DomainEventPublisher;
 import com.lawyus.dataetl.taskmanagement.orchestrator.event.EtlTaskTransitioned;
 import com.lawyus.dataetl.taskmanagement.orchestrator.policy.BackoffSchedule;
+import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskCheckpointRepository;
 import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskRunRepository;
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.slf4j.Logger;
@@ -48,6 +49,7 @@ public class OrchestratorService implements OrchestratorEngine {
     private static final Logger log = LoggerFactory.getLogger(OrchestratorService.class);
 
     private final EtlTaskRunRepository runRepository;
+    private final EtlTaskCheckpointRepository checkpointRepository;
     private final EtlTaskRepository taskRepository;
     private final GuardChain guardChain;
     private final OrchestratorMetrics metrics;
@@ -56,6 +58,7 @@ public class OrchestratorService implements OrchestratorEngine {
     private final RunCounterProjector counterProjector;
 
     public OrchestratorService(EtlTaskRunRepository runRepository,
+                               EtlTaskCheckpointRepository checkpointRepository,
                                EtlTaskRepository taskRepository,
                                GuardChain guardChain,
                                OrchestratorMetrics metrics,
@@ -63,6 +66,7 @@ public class OrchestratorService implements OrchestratorEngine {
                                OrchestratorProperties properties,
                                RunCounterProjector counterProjector) {
         this.runRepository = runRepository;
+        this.checkpointRepository = checkpointRepository;
         this.taskRepository = taskRepository;
         this.guardChain = guardChain;
         this.metrics = metrics;
@@ -175,13 +179,21 @@ public class OrchestratorService implements OrchestratorEngine {
                 if (from == DISPATCHED) {
                     // T8 心跳超时回退 + attempt_no+1 + 退避
                     runRepository.incrementAttemptAndSchedule(runId, nextAttemptAt(now, run.getAttemptNo()));
+                } else if (from == NEEDS_ATTENTION) {
+                    // T24 人工 /retry：重置失败/跳过分片并推进 fencing，不排退避
+                    int nextAttempt = nextAttempt(run);
+                    runRepository.incrementAttemptAndSchedule(runId, null);
+                    runRepository.markQueuedReason(runId, "SCHEDULED");
+                    checkpointRepository.resetRetryableShards(runId, nextAttempt);
                 } else {
                     runRepository.markQueuedReason(runId, "SCHEDULED");
                 }
                 break;
             case RETRYING:
-                // T12/T17：attempt_no+1，排定退避到期时间
+                // T12/T17：attempt_no+1，排定退避到期时间；FAILED 分片重置为 PENDING，从 last_cursor 续跑
+                int retryAttempt = nextAttempt(run);
                 runRepository.incrementAttemptAndSchedule(runId, nextAttemptAt(now, run.getAttemptNo()));
+                checkpointRepository.resetFailedShards(runId, retryAttempt);
                 break;
             case NEEDS_ATTENTION:
                 runRepository.markFinished(runId, null, summarize(ctx, from, to));
@@ -210,6 +222,11 @@ public class OrchestratorService implements OrchestratorEngine {
     private String summarize(TransitionContext ctx, EtlTaskStatus from, EtlTaskStatus to) {
         String ec = ctx.errorClass() == null ? "" : ("[" + ctx.errorClass().name() + "] ");
         return ec + from + "->" + to + ": " + (ctx.reason() == null ? "" : ctx.reason());
+    }
+
+    /** 下一次 attempt 序号（当前 +1，空视为 1）。 */
+    private static int nextAttempt(EtlTaskRun run) {
+        return (run.getAttemptNo() == null ? 1 : run.getAttemptNo()) + 1;
     }
 
     /** 退避：从集中配置 {@code etl.orchestrator.backoff-task-attempts} 取档（§7.8，代码不写死）。 */

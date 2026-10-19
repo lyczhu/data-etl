@@ -83,6 +83,7 @@ etl:
     max-concurrent-shards: 24
     shard-max-total: 5000
     shard-chunk-size: 8          # IT 源表 20 行 → 3 个分片，覆盖多分片收敛
+    shard-target-count: 3        # 分片数 = 并行单元（v2 D4），与 chunk 解耦
   routing:
     new-worker: false            # 用例内按需翻转，@AfterEach 复原
     shadow-compare: false

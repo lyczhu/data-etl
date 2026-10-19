@@ -7,6 +7,6 @@ import org.springframework.web.bind.annotation.PathVariable;
 @FeignClient(name = "data-source-service")
 public interface DataSourceServiceClient {
     
-    @GetMapping("/api/data-sources/{id}")
+    @GetMapping("/internal/data-sources/{id}/credentials")
     DataSource getDataSourceById(@PathVariable("id") Long dataSourceId);
 }

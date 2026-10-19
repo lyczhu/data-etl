@@ -36,7 +36,8 @@ public class ShardPlanner {
         SourceConnector connector = registry.sourceFor(type);   // V-2：类型未注册即抛，校验失败
         SourceSpec spec = new SourceSpec(type, ds.getUrl(), ds.getUsername(),
                 ds.getPassword(), ds.getDriverClassName(), sourceTable);
-        ShardParams params = new ShardParams(properties.getShardChunkSize(), properties.getShardMaxTotal());
+        ShardParams params = new ShardParams(properties.getShardChunkSize(), properties.getShardMaxTotal(),
+                properties.getShardTargetCount());
         return connector.planShards(spec, params);
     }
 

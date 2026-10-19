@@ -1,10 +1,10 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator.dispatch;
 
+import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
-import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.DispatchProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
@@ -25,14 +25,19 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
 
 /**
- * 派工泵（{@code orchestrator-design.md §7.2}）：把 QUEUED run 的 PENDING 分片派成 {@code etl.task.dispatch.batch}
- * 消息，run 层仅首个分片跃迁 {@code QUEUED → DISPATCHED}（T5）；令牌不足标 {@code queued_reason=THROTTLED}（T6，非迁移）。
+ * 派工泵（{@code orchestrator-design.md §7.2} / 方案 v2 WP-01）。
  *
- * <p>与 sweeper 同构：单实例（Redisson 锁）、只经 {@link OrchestratorService#transition} 落状态。
- * 受 {@link RoutingProperties#isNewWorker()} 影子开关门控——关闭时泵休眠，现网旧链路（{@code TaskScheduler}）不受影响。
+ * <p>与 v1 的关键差异（P0-1）：
+ * <ul>
+ *   <li>扫描 {@code QUEUED/DISPATCHED/RUNNING} 中仍有 PENDING 分片的 run，<b>持续补派</b>，
+ *       不再只派首批 {@code permitsPerRun} 片；</li>
+ *   <li>令牌<b>尽量获取</b>（{@link TokenBucket#tryAcquireUpTo}），不足时部分派工而非整体饿死；</li>
+ *   <li>派工消息等待 broker ack；失败保持 PENDING、不标 ASSIGNED；</li>
+ *   <li>{@code QUEUED→DISPATCHED}（T5）只在 run 仍为 QUEUED 时发生一次。</li>
+ * </ul>
  *
- * <p>事务边界：{@link #dispatchOne} 经自注入代理（{@code @Lazy}）调用，使"分片置 ASSIGNED + T5 迁移"原子；
- * 派工消息在事务内直投（Phase 1 弱 at-least-once，Phase 2 切 outbox）。
+ * <p>事务边界：{@link #dispatchOne} 经自注入代理（{@code @Lazy}）调用，使"分片置 ASSIGNED + T5 迁移"原子。
+ * Phase 1B 切最小 outbox 前，消息在事务内直投（失败抛异常回滚，分片保持 PENDING）。
  */
 @Component
 public class DispatchService {
@@ -86,9 +91,9 @@ public class DispatchService {
             return;
         }
         try {
-            List<EtlTaskRun> queued = runRepository.findQueuedForDispatch(
+            List<EtlTaskRun> runs = runRepository.findDispatchableRuns(
                     PageRequest.of(0, dispatchProperties.getPumpBatch()));
-            for (EtlTaskRun run : queued) {
+            for (EtlTaskRun run : runs) {
                 self.dispatchOne(run);
             }
         } finally {
@@ -98,51 +103,62 @@ public class DispatchService {
         }
     }
 
-    /** 单个 QUEUED run 的派工（事务单元）。 */
+    /** 单个 run 的派工（事务单元）：尽量补齐到 permitsPerRun 的在跑分片。 */
     @Transactional
     public void dispatchOne(EtlTaskRun run) {
         String runId = run.getRunId();
         long pending = checkpointRepository.countPendingShards(runId);
         if (pending <= 0) {
-            return;   // 尚无分片计划（validate/V-4 未落地），无可派
+            return;   // 尚无分片计划或已全部派完
         }
-        int permits = (int) Math.min(pending, dispatchProperties.getPermitsPerRun());
-        if (!tokenBucket.tryAcquire(permits)) {
-            runRepository.markQueuedReason(runId, "THROTTLED");   // T6：非状态迁移
+        int desired = (int) Math.min(pending, dispatchProperties.getPermitsPerRun());
+        int permits = tokenBucket.tryAcquireUpTo(desired);
+        if (permits <= 0) {
+            if (run.statusEnum() == EtlTaskStatus.QUEUED) {
+                runRepository.markQueuedReason(runId, "THROTTLED");   // T6：非状态迁移
+            }
             metrics.dispatchThrottled();
             return;
         }
 
         List<EtlTaskCheckpoint> shards =
                 checkpointRepository.findPendingShards(runId, PageRequest.of(0, permits));
-        boolean first = true;
+        int attempt = run.getAttemptNo() == null ? 1 : run.getAttemptNo();
+        boolean firstQueued = run.statusEnum() == EtlTaskStatus.QUEUED;
         int dispatched = 0;
+        int released = 0;
         for (EtlTaskCheckpoint shard : shards) {
             try {
                 ShardDispatchCommand cmd = assembler.assemble(run, shard);
-                publisher.publish(cmd);
-                checkpointRepository.markAssigned(run.getTaskId(), runId, shard.getShardId());
+                publisher.publish(cmd);   // 等待 broker ack；失败抛异常
+                // CAS：只有真正从 PENDING 转出才计成功；并发泵已派则归还令牌
+                int updated = checkpointRepository.markAssigned(
+                        run.getTaskId(), runId, shard.getShardId(), attempt);
+                if (updated == 0) {
+                    tokenBucket.release(1);
+                    released++;
+                    continue;
+                }
                 dispatched++;
                 metrics.dispatchShardPublished();
-                if (first) {
-                    // T5：首片派出时 run 跃迁 QUEUED → DISPATCHED
+                if (firstQueued) {
+                    // T5：首片派出时 run 跃迁 QUEUED → DISPATCHED（仅一次）
                     TransitionContext ctx = TransitionContext.builder(run.getTaskId())
                             .reason("DISPATCH").actor("orchestrator:dispatch").build();
                     orchestrator.transition(runId, EtlTaskStatus.QUEUED, EtlTaskStatus.DISPATCHED, ctx);
-                    first = false;
+                    firstQueued = false;
                 }
             } catch (GuardFailureException | IllegalStateTransitionException e) {
                 log.warn("pump: run={} shard={} dispatch skipped: {}", runId, shard.getShardId(), e.getMessage());
                 break;
             } catch (RuntimeException e) {
-                // 组装/发送失败（源不可达等）：保持 QUEUED，未派分片留在 PENDING，下轮或 sweeper 重试
-                log.error("pump: run={} shard={} dispatch failed, keep QUEUED: {}",
+                // 组装/发送失败：分片保持 PENDING，下轮补派；不污染状态机
+                log.error("pump: run={} shard={} dispatch failed, keep PENDING: {}",
                         runId, shard.getShardId(), e.getMessage(), e);
                 break;
             }
         }
-        // 预占但未成功派发的许可即时归还（精确计，未超发）
-        int unused = permits - dispatched;
+        int unused = permits - dispatched - released;
         if (unused > 0) {
             tokenBucket.release(unused);
         }

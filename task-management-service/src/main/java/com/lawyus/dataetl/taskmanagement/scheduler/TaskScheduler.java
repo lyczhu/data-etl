@@ -5,6 +5,8 @@ import com.lawyus.dataetl.taskmanagement.client.DataSource;
 import com.lawyus.dataetl.taskmanagement.client.DataSourceServiceClient;
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
 import com.lawyus.dataetl.taskmanagement.entity.EtlTaskMessage;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
+import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
@@ -49,6 +51,12 @@ public class TaskScheduler {
     @Autowired
     private RedissonClient redissonClient;
 
+    @Autowired
+    private RoutingProperties routing;
+
+    @Autowired
+    private OrchestratorService orchestrator;
+
     private static final String TASK_LOCK_KEY ="task:scheduler:lock";
 
     @Scheduled(fixedRate = 30_000)
@@ -59,12 +67,21 @@ public class TaskScheduler {
             try {
                 newTasks = etlTaskRepository.findByStatus("new");
                 if (CollectionUtils.isEmpty(newTasks)) return;
+                // WP-16/P1-9：已被新链路接管（白名单命中且有 current run）的任务不走旧链路，避免双跑；
+                // 白名单命中但 run 未建成功（提交链异常）的仍由旧链路兜底，不让任务永久卡住。
+                newTasks = newTasks.stream().filter(t -> !newPipelineOwns(t)).toList();
+                if (CollectionUtils.isEmpty(newTasks)) return;
                 newTasks.forEach(this::updateStatus);
             } finally {
                 rLock.unlock();
             }
             newTasks.forEach(this::processNewTask);
         }
+    }
+
+    private boolean newPipelineOwns(EtlTask task) {
+        return routing.isNewWorkerFor(task.getDataSourceId())
+                && orchestrator.currentRun(task.getTaskId()).isPresent();
     }
 
     private void updateStatus(EtlTask task) {

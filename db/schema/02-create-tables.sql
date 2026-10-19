@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS etl_task (
     id SERIAL PRIMARY KEY,
     task_id VARCHAR(64) NOT NULL UNIQUE, -- 任务UUID，全局唯一
     data_source_id INT NOT NULL REFERENCES data_source(id) ON DELETE CASCADE, -- 关联的数据源ID，删除数据源时级联删除相关任务
+    target_data_source_id INT, -- 目标数据源ID（WP-03/D15；为空 = 写 worker 本地库）
     source_table_name VARCHAR(100) NOT NULL, -- 源表名称
     target_table_name VARCHAR(100) NOT NULL, -- 目标表名称
     status VARCHAR(20) NOT NULL DEFAULT 'new', -- 任务状态：new, running, completed, failed, paused
@@ -31,6 +32,9 @@ CREATE TABLE IF NOT EXISTS etl_task (
     end_time TIMESTAMP, -- 任务结束时间
     error_message TEXT -- 错误信息，仅在任务失败时填充
 );
+
+-- 既有库迁移（幂等）
+ALTER TABLE etl_task ADD COLUMN IF NOT EXISTS target_data_source_id INT;
 
 -- 索引创建
 CREATE INDEX IF NOT EXISTS idx_etl_task_status ON etl_task(status);

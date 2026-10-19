@@ -73,7 +73,10 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
   checkpoint aggregate (`RunCounterProjector`), never an increment — at-least-once delivery projects the same aggregate
   repeatedly. They deliberately exclude `shard_total`, which is the T2 *plan* count and the basis of G-4/convergence;
   projecting over it would zero it while no shards exist. Without the mirror those columns stay 0 and §12.2 check 2
-  passes vacuously (`rows_out + rows_dropped <> rows_in` is false when all three are 0).
+  passes vacuously (`rows_out + rows_dropped + rows_deduped <> rows_in` is false when all four are 0).
+- G-4 / INV-4 balance is **four-term**: `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in`. A crash after
+  the target commit but before the checkpoint write replays the same rows, so `rows_in` and `rows_deduped` both grow by
+  the same amount. Do not exclude `rows_deduped` — that turns a correct idempotent replay into `NEEDS_ATTENTION`.
 
 ## Toolchain
 

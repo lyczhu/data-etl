@@ -28,32 +28,40 @@ public final class TransformerFactory {
         if (keepColumns != null && !keepColumns.isEmpty()) {
             steps.add(new FieldPruneTransformer(keepColumns, true));
         }
+        // WP-07：numberScale < 0 = 不启用数值截断（默认），只在任务显式配置精度时追加
+        boolean scaleEnabled = numberScale >= 0;
         switch (profile) {
             case CSV:
             case MONGO:
                 steps.add(new StringTrimTransformer());
                 steps.add(new DateNormalizeTransformer());
                 steps.add(new TypeCoercionTransformer());
-                steps.add(new NumberScaleTransformer(numberScale));
+                addScale(steps, scaleEnabled, numberScale);
                 break;
             case JSON:
                 steps.add(new DateNormalizeTransformer());
                 steps.add(new TypeCoercionTransformer());
-                steps.add(new NumberScaleTransformer(numberScale));
+                addScale(steps, scaleEnabled, numberScale);
                 break;
             case GEOJSON:
                 steps.add(new StringTrimTransformer());
                 steps.add(new DateNormalizeTransformer());
                 steps.add(new TypeCoercionTransformer());
                 steps.add(new GeoJsonToWktTransformer());
-                steps.add(new NumberScaleTransformer(numberScale));
+                addScale(steps, scaleEnabled, numberScale);
                 break;
             case JDBC:
             default:
                 steps.add(new DateNormalizeTransformer());
-                steps.add(new NumberScaleTransformer(numberScale));
+                addScale(steps, scaleEnabled, numberScale);
                 break;
         }
         return CompositeTransformer.of(steps.toArray(new RecordTransformer[0]));
+    }
+
+    private static void addScale(List<RecordTransformer> steps, boolean enabled, int numberScale) {
+        if (enabled) {
+            steps.add(new NumberScaleTransformer(numberScale));
+        }
     }
 }

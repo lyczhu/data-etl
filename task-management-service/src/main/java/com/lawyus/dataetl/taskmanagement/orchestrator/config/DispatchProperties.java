@@ -20,6 +20,8 @@ public class DispatchProperties {
     private int shardMaxTotal = 5000;
     /** 每分片目标行数（JDBC 主键区间分片的 chunk 大小，§5.2 默认 5000）。 */
     private int shardChunkSize = 5000;
+    /** 分片目标数（并行单元，方案 v2 D4；与 chunk 大小解耦，默认 16）。 */
+    private int shardTargetCount = 16;
 
     public int getPumpBatch() {
         return pumpBatch;
@@ -59,5 +61,13 @@ public class DispatchProperties {
 
     public void setShardChunkSize(int shardChunkSize) {
         this.shardChunkSize = shardChunkSize;
+    }
+
+    public int getShardTargetCount() {
+        return shardTargetCount;
+    }
+
+    public void setShardTargetCount(int shardTargetCount) {
+        this.shardTargetCount = shardTargetCount;
     }
 }

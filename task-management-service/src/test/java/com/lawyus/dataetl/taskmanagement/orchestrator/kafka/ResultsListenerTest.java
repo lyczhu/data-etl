@@ -1,8 +1,8 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator.kafka;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.lawyus.dataetl.taskmanagement.orchestrator.ConvergenceService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
-import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunAggregate;
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunCounterProjector;
@@ -13,13 +13,13 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.dispatch.TokenBucket;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
 import com.lawyus.dataetl.taskmanagement.orchestrator.kafka.dto.ResultMessage;
 import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskCheckpointRepository;
+import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskDltRepository;
 import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskRunRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.util.Date;
 import java.util.Optional;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -47,9 +47,10 @@ class ResultsListenerTest {
         orchestrator = mock(OrchestratorService.class);
         tokenBucket = mock(TokenBucket.class);
         counterProjector = mock(RunCounterProjector.class);
+        OrchestratorProperties properties = new OrchestratorProperties();
         listener = new ResultsListener(new ObjectMapper(), runRepository, checkpointRepository,
-                orchestrator, mock(OrchestratorMetrics.class), new OrchestratorProperties(),
-                new RoutingProperties(), tokenBucket, counterProjector);
+                orchestrator, properties, new RoutingProperties(), tokenBucket, counterProjector,
+                new ConvergenceService(orchestrator, properties, mock(EtlTaskDltRepository.class)));
     }
 
     private EtlTaskRun runWith(String status, int shardTotal) {
@@ -60,7 +61,8 @@ class ResultsListenerTest {
     }
 
     private static RunAggregate agg(long pending, long assigned, long running, long succeeded,
-                                    long failed, long skipped, long rowsIn, long rowsOut, long rowsDropped) {
+                                    long failed, long skipped, long rowsIn, long rowsOut,
+                                    long rowsFiltered, long rowsFailed) {
         return new RunAggregate() {
             @Override public Long getPending() { return pending; }
             @Override public Long getAssigned() { return assigned; }
@@ -70,7 +72,9 @@ class ResultsListenerTest {
             @Override public Long getSkipped() { return skipped; }
             @Override public Long getRowsIn() { return rowsIn; }
             @Override public Long getRowsOut() { return rowsOut; }
-            @Override public Long getRowsDropped() { return rowsDropped; }
+            @Override public Long getRowsDropped() { return rowsFiltered + rowsFailed; }
+            @Override public Long getRowsFiltered() { return rowsFiltered; }
+            @Override public Long getRowsFailed() { return rowsFailed; }
             @Override public Long getRowsDeduped() { return 0L; }
         };
     }
@@ -90,7 +94,7 @@ class ResultsListenerTest {
         when(runRepository.findByRunId("run-1"))
                 .thenReturn(Optional.of(runWith("RUNNING", 2)));
         when(checkpointRepository.aggregate("run-1"))
-                .thenReturn(agg(0, 0, 0, 2, 0, 0, 100, 100, 0));
+                .thenReturn(agg(0, 0, 0, 2, 0, 0, 100, 100, 0, 0));
 
         listener.handle(msg());
 
@@ -101,10 +105,39 @@ class ResultsListenerTest {
     }
 
     @Test
+    @DisplayName("全成功 + filtered 行参与对账 → 仍 SUCCEEDED（WP-04）")
+    void filteredRowsStillSucceed() {
+        when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(runWith("RUNNING", 1)));
+        when(checkpointRepository.aggregate("run-1"))
+                .thenReturn(agg(0, 0, 0, 1, 0, 0, 10, 8, 2, 0));
+
+        listener.handle(msg());
+
+        verify(orchestrator).transition(eq("run-1"), eq(EtlTaskStatus.RUNNING),
+                eq(EtlTaskStatus.SUCCEEDED), any(TransitionContext.class));
+    }
+
+    @Test
+    @DisplayName("全分片 SUCCEEDED 但存在 rows_failed → NEEDS_ATTENTION（不得静默成功）")
+    void failedRowsNeverSucceed() {
+        when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(runWith("RUNNING", 1)));
+        when(checkpointRepository.aggregate("run-1"))
+                .thenReturn(agg(0, 0, 0, 1, 0, 0, 10, 9, 0, 1));
+
+        listener.handle(msg());
+
+        verify(orchestrator).transition(eq("run-1"), eq(EtlTaskStatus.RUNNING),
+                eq(EtlTaskStatus.NEEDS_ATTENTION), any(TransitionContext.class));
+        verify(orchestrator, never()).transition(eq("run-1"), eq(EtlTaskStatus.RUNNING),
+                eq(EtlTaskStatus.SUCCEEDED), any(TransitionContext.class));
+    }
+
+    @Test
     @DisplayName("有失败其余成功 → RUNNING→PARTIAL_SUCCESS（T11）")
     void convergesToPartial() {
         when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(runWith("RUNNING", 2)));
-        when(checkpointRepository.aggregate("run-1")).thenReturn(agg(0, 0, 0, 1, 1, 0, 100, 50, 0));
+        when(checkpointRepository.aggregate("run-1"))
+                .thenReturn(agg(0, 0, 0, 1, 1, 0, 100, 50, 0, 0));
 
         listener.handle(msg());
 
@@ -116,7 +149,8 @@ class ResultsListenerTest {
     @DisplayName("全成功但行数不平 → RUNNING→NEEDS_ATTENTION(ROW_BALANCE_VIOLATION)（T13）")
     void imbalanceToNeedsAttention() {
         when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(runWith("RUNNING", 2)));
-        when(checkpointRepository.aggregate("run-1")).thenReturn(agg(0, 0, 0, 2, 0, 0, 100, 60, 10));
+        when(checkpointRepository.aggregate("run-1"))
+                .thenReturn(agg(0, 0, 0, 2, 0, 0, 100, 60, 10, 0));
 
         listener.handle(msg());
 
@@ -128,7 +162,8 @@ class ResultsListenerTest {
     @DisplayName("仍有活跃分片 → 不收敛、不迁移，但计数仍投影（中间态不准是 bug）")
     void notConvergedNoTransition() {
         when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(runWith("RUNNING", 3)));
-        when(checkpointRepository.aggregate("run-1")).thenReturn(agg(0, 1, 1, 1, 0, 0, 50, 50, 0));
+        when(checkpointRepository.aggregate("run-1"))
+                .thenReturn(agg(0, 1, 1, 1, 0, 0, 50, 50, 0, 0));
 
         listener.handle(msg());
 
@@ -141,9 +176,9 @@ class ResultsListenerTest {
     void dispatchBackfillsRunningThenConverges() {
         EtlTaskRun dispatched = runWith("DISPATCHED", 1);
         EtlTaskRun running = runWith("RUNNING", 1);
-        // 第一次查返回 DISPATCHED，补 T7 后再查返回 RUNNING
         when(runRepository.findByRunId("run-1")).thenReturn(Optional.of(dispatched), Optional.of(running));
-        when(checkpointRepository.aggregate("run-1")).thenReturn(agg(0, 0, 0, 1, 0, 0, 10, 10, 0));
+        when(checkpointRepository.aggregate("run-1"))
+                .thenReturn(agg(0, 0, 0, 1, 0, 0, 10, 10, 0, 0));
 
         listener.handle(msg());
 

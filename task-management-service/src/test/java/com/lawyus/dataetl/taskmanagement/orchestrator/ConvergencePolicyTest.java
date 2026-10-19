@@ -10,6 +10,12 @@ class ConvergencePolicyTest {
     /** 测试用聚合视图（各计数字段直接构造）。 */
     private static RunAggregate agg(long pending, long assigned, long running, long succeeded,
                                     long failed, long skipped, long rowsIn, long rowsOut, long rowsDropped) {
+        return agg(pending, assigned, running, succeeded, failed, skipped, rowsIn, rowsOut, rowsDropped, 0);
+    }
+
+    private static RunAggregate agg(long pending, long assigned, long running, long succeeded,
+                                    long failed, long skipped, long rowsIn, long rowsOut,
+                                    long rowsFiltered, long rowsFailed) {
         return new RunAggregate() {
             @Override public Long getPending() { return pending; }
             @Override public Long getAssigned() { return assigned; }
@@ -19,8 +25,29 @@ class ConvergencePolicyTest {
             @Override public Long getSkipped() { return skipped; }
             @Override public Long getRowsIn() { return rowsIn; }
             @Override public Long getRowsOut() { return rowsOut; }
+            @Override public Long getRowsDropped() { return rowsFiltered + rowsFailed; }
+            @Override public Long getRowsFiltered() { return rowsFiltered; }
+            @Override public Long getRowsFailed() { return rowsFailed; }
+            @Override public Long getRowsDeduped() { return 0L; }
+        };
+    }
+
+    /** 带幂等命中数的聚合（崩溃重放场景：重放读入 rows_in，命中计入 deduped）。 */
+    private static RunAggregate aggDeduped(long succeeded, long rowsIn, long rowsOut, long rowsDropped,
+                                           long rowsDeduped) {
+        return new RunAggregate() {
+            @Override public Long getPending() { return 0L; }
+            @Override public Long getAssigned() { return 0L; }
+            @Override public Long getRunning() { return 0L; }
+            @Override public Long getSucceeded() { return succeeded; }
+            @Override public Long getFailed() { return 0L; }
+            @Override public Long getSkipped() { return 0L; }
+            @Override public Long getRowsIn() { return rowsIn; }
+            @Override public Long getRowsOut() { return rowsOut; }
             @Override public Long getRowsDropped() { return rowsDropped; }
-            @Override public Long getRowsDeduped() { return 0L; }   // 不入对账等式（D-08），收敛判定用不到
+            @Override public Long getRowsFiltered() { return rowsDropped; }
+            @Override public Long getRowsFailed() { return 0L; }
+            @Override public Long getRowsDeduped() { return rowsDeduped; }
         };
     }
 
@@ -67,10 +94,35 @@ class ConvergencePolicyTest {
     }
 
     @Test
-    @DisplayName("dedup 跨 attempt：等式仍平（rows_deduped 不入等式，D-08）")
-    void dedupKeepsBalance() {
-        // rows_out(50)+rows_dropped(0)=rows_in(50)，dedup 不计 → 仍 SUCCEEDED
-        ConvergencePolicy.Outcome r = ConvergencePolicy.evaluate(agg(0, 0, 0, 1, 0, 0, 50, 50, 0), 1, false);
+    @DisplayName("崩溃重放：重放行计入 rows_in，幂等命中计入 deduped，等式仍平并可成功")
+    void dedupReplayKeepsBalance() {
+        // 首次写入 50 行（out=50）；checkpoint 未写时重放再读 50 行（in=100），全部 ON CONFLICT → deduped=50
+        ConvergencePolicy.Outcome r = ConvergencePolicy.evaluate(
+                aggDeduped(1, 100, 50, 0, 50), 1, false);
+        assertThat(r).isEqualTo(ConvergencePolicy.Outcome.SUCCEEDED);
+    }
+
+    @Test
+    @DisplayName("崩溃重放但 deduped 未入账 → 对账不平，保守转人工")
+    void dedupMissingBreaksBalance() {
+        ConvergencePolicy.Outcome r = ConvergencePolicy.evaluate(
+                aggDeduped(1, 100, 50, 0, 0), 1, false);
+        assertThat(r).isEqualTo(ConvergencePolicy.Outcome.NEEDS_ATTENTION_BALANCE);
+    }
+
+    @Test
+    @DisplayName("全 SUCCEEDED 但存在 rows_failed → NEEDS_ATTENTION_BALANCE（WP-04）")
+    void failedRowsBlockSuccess() {
+        ConvergencePolicy.Outcome r = ConvergencePolicy.evaluate(
+                agg(0, 0, 0, 1, 0, 0, 10, 9, 0, 1), 1, false);
+        assertThat(r).isEqualTo(ConvergencePolicy.Outcome.NEEDS_ATTENTION_BALANCE);
+    }
+
+    @Test
+    @DisplayName("filtered 参与对账：rows_out+rows_filtered=rows_in → SUCCEEDED")
+    void filteredRowsKeepBalance() {
+        ConvergencePolicy.Outcome r = ConvergencePolicy.evaluate(
+                agg(0, 0, 0, 1, 0, 0, 10, 8, 2, 0), 1, false);
         assertThat(r).isEqualTo(ConvergencePolicy.Outcome.SUCCEEDED);
     }
 

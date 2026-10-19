@@ -16,17 +16,17 @@ public class NumberScaleTransformer implements RecordTransformer {
     private final int scale;
 
     public NumberScaleTransformer(int scale) {
-        this.scale = Math.max(0, scale);
+        this.scale = scale;
     }
 
     public NumberScaleTransformer() {
-        this(2);
+        this(-1);
     }
 
     @Override
     public SourceRecord apply(SourceRecord record) {
-        if (record == null || record.columns() == null) {
-            return record;
+        if (record == null || record.columns() == null || scale < 0) {
+            return record;   // WP-07：未显式配置精度时原样保留（金额/坐标/ID 不被默认四舍五入）
         }
         LinkedHashMap<String, Object> out = new LinkedHashMap<>();
         for (Map.Entry<String, Object> e : record.columns().entrySet()) {
@@ -37,6 +37,9 @@ public class NumberScaleTransformer implements RecordTransformer {
 
     /** 可见以便单测。 */
     Object scaleValue(Object v) {
+        if (scale < 0) {
+            return v;
+        }
         if (v instanceof Double || v instanceof Float) {
             return BigDecimal.valueOf(((Number) v).doubleValue()).setScale(scale, RoundingMode.HALF_UP);
         }

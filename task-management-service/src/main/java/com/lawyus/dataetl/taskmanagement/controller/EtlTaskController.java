@@ -1,6 +1,9 @@
 package com.lawyus.dataetl.taskmanagement.controller;
 
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
+import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
+import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
+import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorCommandService;
 import com.lawyus.dataetl.taskmanagement.service.EtlTaskService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -13,6 +16,9 @@ import java.util.List;
 public class EtlTaskController {
     @Autowired
     private EtlTaskService etlTaskService;
+
+    @Autowired
+    private OrchestratorCommandService commandService;
 
     @GetMapping
     public List<EtlTask> getAllTasks() {
@@ -51,5 +57,73 @@ public class EtlTaskController {
     public ResponseEntity<Void> deleteTask(@PathVariable(value = "id") Long taskId) {
         etlTaskService.deleteTask(taskId);
         return ResponseEntity.noContent().build();
+    }
+
+    // --- 编排器人工干预 API（WP-14 / Gate 2 最小闭环） ---
+
+    @GetMapping("/{taskId}/progress")
+    public ResponseEntity<?> progress(@PathVariable String taskId) {
+        return execute(() -> ResponseEntity.ok(commandService.progress(taskId)));
+    }
+
+    @GetMapping("/{taskId}/failures")
+    public ResponseEntity<?> failures(@PathVariable String taskId) {
+        return execute(() -> ResponseEntity.ok(commandService.failures(taskId)));
+    }
+
+    @PostMapping("/{taskId}/cancel")
+    public ResponseEntity<?> cancel(@PathVariable String taskId) {
+        return execute(() -> {
+            commandService.cancel(taskId);
+            return ResponseEntity.accepted().body("CANCEL_REQUESTED");
+        });
+    }
+
+    @PostMapping("/{taskId}/retry")
+    public ResponseEntity<?> retry(@PathVariable String taskId) {
+        return execute(() -> {
+            commandService.retry(taskId);
+            return ResponseEntity.accepted().body("RETRY_ACCEPTED");
+        });
+    }
+
+    @PostMapping("/{taskId}/resume")
+    public ResponseEntity<?> resume(@PathVariable String taskId) {
+        return execute(() -> {
+            commandService.resume(taskId);
+            return ResponseEntity.accepted().body("RESUMED");
+        });
+    }
+
+    @PostMapping("/{taskId}/abort")
+    public ResponseEntity<?> abort(@PathVariable String taskId) {
+        return execute(() -> {
+            commandService.abort(taskId);
+            return ResponseEntity.accepted().body("ABORTED");
+        });
+    }
+
+    @PostMapping("/{taskId}/mark-succeeded-with-data-loss")
+    public ResponseEntity<?> markSucceeded(@PathVariable String taskId) {
+        return execute(() -> {
+            commandService.markSucceededWithDataLoss(taskId);
+            return ResponseEntity.accepted().body("MARKED_SUCCEEDED");
+        });
+    }
+
+    /** 统一错误映射：无 current run → 404；非法状态/guard → 409。 */
+    private ResponseEntity<?> execute(CommandCall call) {
+        try {
+            return call.run();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.status(404).body(e.getMessage());
+        } catch (IllegalStateException | GuardFailureException | IllegalStateTransitionException e) {
+            return ResponseEntity.status(409).body(e.getMessage());
+        }
+    }
+
+    @FunctionalInterface
+    private interface CommandCall {
+        ResponseEntity<?> run();
     }
 }

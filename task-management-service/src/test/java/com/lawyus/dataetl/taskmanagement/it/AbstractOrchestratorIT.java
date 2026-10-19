@@ -256,12 +256,14 @@ public abstract class AbstractOrchestratorIT {
     protected void seedCheckpoint(String taskId, String runId, String shardId, EtlShardStatus status,
                                   long rowsIn, long rowsOut, long rowsDropped, long rowsDeduped,
                                   String errorClass) {
+        // 旧夹具的 rowsDropped 语义是“业务过滤”，WP-04 拆列后回填到 rows_filtered；
+        // rows_failed 保持 0，既有收敛/对账用例的行为不变。
         jdbc.update("INSERT INTO etl_task_checkpoint "
-                        + "(task_id, run_id, shard_id, status, rows_in, rows_out, rows_dropped, rows_deduped, "
-                        + " error_class, pk_from, pk_to, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, now())",
-                taskId, runId, shardId, status.name(), rowsIn, rowsOut, rowsDropped, rowsDeduped,
-                errorClass, rowsIn + rowsDropped);
+                        + "(task_id, run_id, shard_id, status, rows_in, rows_out, rows_filtered, rows_failed, "
+                        + " rows_dropped, rows_deduped, error_class, pk_from, pk_to, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 1, ?, now())",
+                taskId, runId, shardId, status.name(), rowsIn, rowsOut, rowsDropped, rowsDropped,
+                rowsDeduped, errorClass, rowsIn + rowsDropped);
     }
 
     /** 把 checkpoint 的 updated_at 往前推（卡死/活动判定用）。 */

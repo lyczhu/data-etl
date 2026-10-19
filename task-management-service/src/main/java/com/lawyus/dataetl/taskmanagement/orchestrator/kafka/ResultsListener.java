@@ -1,12 +1,10 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator.kafka;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.lawyus.dataetl.taskmanagement.orchestrator.ConvergencePolicy;
-import com.lawyus.dataetl.taskmanagement.orchestrator.ErrorClass;
+import com.lawyus.dataetl.taskmanagement.orchestrator.ConvergenceService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus;
 import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
-import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorMetrics;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunAggregate;
 import com.lawyus.dataetl.taskmanagement.orchestrator.RunCounterProjector;
@@ -26,15 +24,15 @@ import org.springframework.stereotype.Component;
 import java.util.Optional;
 
 /**
- * 收敛监听器（{@code etl.task.results}，{@code orchestrator-design.md §7.5}）。
+ * 收敛监听器（{@code etl.task.results}，{@code orchestrator-design.md §7.5} / 方案 v2 WP-05/WP-10）。
  *
- * <p>results 只是<b>触发器</b>：收到即对 checkpoint 做一次聚合重算（{@link ConvergencePolicy}），
- * 据实发 {@code RUNNING → SUCCEEDED/PARTIAL_SUCCESS/FAILED/CANCELLED/NEEDS_ATTENTION}（T10/T11/T14/T15/T13），
- * worker 自报的行数<b>不参与</b>终局判定（P1/D-16）。尚未收敛（仍有 PENDING/ASSIGNED/RUNNING 分片）则原样返回，
- * 等下一批 results 或 sweeper 兜底。
+ * <p>results 只是<b>触发器</b>：收到即对 checkpoint 做一次聚合重算，交给 {@link ConvergenceService}
+ * 决定终局（或 T12 自动重试）。worker 自报的行数<b>不参与</b>终局判定（P1/D-16）。
  *
  * <p>每条 results 代表一个分片跑完，归还 1 个令牌（{@link TokenBucket#releaseWithinCapacity} 防重复投递超发）。
- * 聚合结果同时用于 {@link RunCounterProjector} 的计数投影（含未收敛的中间态），使 run 行不再停着 0。
+ * 聚合结果同时用于 {@link RunCounterProjector} 的计数投影（含未收敛的中间态）。
+ *
+ * <p>最后一条 results 丢失由 {@code ConvergenceSweeper} 兜底（同一 {@link ConvergenceService}）。
  */
 @Component
 public class ResultsListener {
@@ -45,30 +43,30 @@ public class ResultsListener {
     private final EtlTaskRunRepository runRepository;
     private final EtlTaskCheckpointRepository checkpointRepository;
     private final OrchestratorService orchestrator;
-    private final OrchestratorMetrics metrics;
     private final OrchestratorProperties properties;
     private final RoutingProperties routing;
     private final TokenBucket tokenBucket;
     private final RunCounterProjector counterProjector;
+    private final ConvergenceService convergenceService;
 
     public ResultsListener(ObjectMapper objectMapper,
                            EtlTaskRunRepository runRepository,
                            EtlTaskCheckpointRepository checkpointRepository,
                            OrchestratorService orchestrator,
-                           OrchestratorMetrics metrics,
                            OrchestratorProperties properties,
                            RoutingProperties routing,
                            TokenBucket tokenBucket,
-                           RunCounterProjector counterProjector) {
+                           RunCounterProjector counterProjector,
+                           ConvergenceService convergenceService) {
         this.objectMapper = objectMapper;
         this.runRepository = runRepository;
         this.checkpointRepository = checkpointRepository;
         this.orchestrator = orchestrator;
-        this.metrics = metrics;
         this.properties = properties;
         this.routing = routing;
         this.tokenBucket = tokenBucket;
         this.counterProjector = counterProjector;
+        this.convergenceService = convergenceService;
     }
 
     @KafkaListener(topics = "${etl.topics.results}", groupId = "task-management-group")
@@ -119,53 +117,7 @@ public class ResultsListener {
 
         RunAggregate a = checkpointRepository.aggregate(run.getRunId());
         // 计数投影放在收敛门之前：未定局的中间态也要随分片推进更新 run 行计数（复用现成聚合值，不重查）。
-        // 终态路径会在 transition 的副作用里再投一次作快照（覆盖 sweeper 驱动、根本没有 results 的终局）。
         counterProjector.project(run.getRunId(), a);
-        int shardTotal = run.getShardTotal() == null ? 0 : run.getShardTotal();
-        boolean cancelRequested = run.getCancelRequestedAt() != null;
-        ConvergencePolicy.Outcome outcome = ConvergencePolicy.evaluate(a, shardTotal, cancelRequested);
-        if (outcome == ConvergencePolicy.Outcome.NOT_CONVERGED) {
-            return;
-        }
-
-        EtlTaskStatus to;
-        String reason;
-        ErrorClass errorClass = null;
-        switch (outcome) {
-            case SUCCEEDED:
-                to = EtlTaskStatus.SUCCEEDED;
-                reason = "ALL_SHARDS_OK";
-                break;
-            case PARTIAL_SUCCESS:
-                to = EtlTaskStatus.PARTIAL_SUCCESS;
-                reason = "SOME_SHARDS_FAILED";
-                break;
-            case FAILED:
-                to = EtlTaskStatus.FAILED;
-                reason = "ALL_SHARDS_FAILED";
-                errorClass = ErrorClass.PERSISTENT;
-                break;
-            case CANCELLED:
-                to = EtlTaskStatus.CANCELLED;
-                reason = "CANCELLED_BY_USER";
-                break;
-            default:   // NEEDS_ATTENTION_BALANCE
-                to = EtlTaskStatus.NEEDS_ATTENTION;
-                reason = "ROW_BALANCE_VIOLATION";
-                errorClass = ErrorClass.FATAL;
-                break;
-        }
-
-        TransitionContext ctx = TransitionContext.builder(run.getTaskId())
-                .reason(reason).actor("kafka:results").errorClass(errorClass)
-                .maxAttempts(properties.getMaxAttempts()).build();
-        try {
-            orchestrator.transition(run.getRunId(), EtlTaskStatus.RUNNING, to, ctx);
-            log.info("results: run={} converged -> {} ({})", run.getRunId(), to, reason);
-        } catch (GuardFailureException | IllegalStateTransitionException e) {
-            // 非法迁移（P5）已由 transition 内部计数；此处不重投（ack），完整 DLT 转储随 Phase 2
-            log.warn("results: convergence transition skipped run={} -> {} cause={}",
-                    run.getRunId(), to, e.getMessage());
-        }
+        convergenceService.converge(run, a, "kafka:results");
     }
 }

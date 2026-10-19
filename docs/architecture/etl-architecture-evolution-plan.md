@@ -237,6 +237,25 @@ POST /api/tasks
 - 安全扫描：Kafka payload/日志/DB 无明文凭据。
 - **未通过则不得开启 `newWorker=true`。**
 
+**执行状态（2026-10-19，本地可执行部分）**
+
+- [x] **WP-01 全量派工**：pump 扫描 `QUEUED/DISPATCHED/RUNNING` 且仍有 PENDING 的 run 持续补派；令牌不足时部分获取。证据：`DispatchServicePumpTest`（9 例）+ `FullDispatchScaleIT`（120 分片，一次 pump 后 `COUNT(PENDING)=0`、全部 `ASSIGNED`）。
+- [x] **WP-02 提交边界+续跑**：chunk 级 `last_cursor/last_pk`、`resumeCursor` 开区间读、同库同事务。证据：`ShardExecutorTest` 的续跑/同库事务用例；`FullChainE2EIT.crashAfterTargetCommitReplaysIdempotently` 在真 PG 上预置“目标已提交、checkpoint 未写”，重放后目标仍 20 行、`rows_deduped=7`、无重复。
+- [x] **WP-03 幂等与目标连接**：目标表 `idempotency_key` 主键 + PG `ON CONFLICT DO NOTHING` / MySQL `ON DUPLICATE KEY UPDATE`；明确 `targetDataSourceId`。证据：`JdbcSinkWriterSqlTest`、`IdempotencyKeysTest`、`ShardExecutorTest`。
+- [x] **WP-04 丢数可见**：`rows_filtered/rows_failed` 拆列、`07-etl-task-dlt.sql`、逐行显式 commit、`rows_failed>0` 不得 `SUCCEEDED`。证据：`ShardExecutorTest`、`KafkaDataPlaneIT` 的 DLT→NEEDS_ATTENTION 用例、`GuardChainTest` G-7。
+- [x] **WP-05 失败处置**：`ErrorClassifier`（TRANSIENT/PERSISTENT/FATAL）+ 分片内退避重试 + T12/T21 + worker DLT 生产。证据：`ErrorClassifierTest`（7 例）、`ShardExecutorTest`（瞬态重试/失败 DLT）、`DltListenerTest`。
+- [x] **WP-06 安全**：派工消息只带 `dataSourceId/targetDataSourceId`（`EntryChainIT` 断言 payload 无 `sourceUrl/password/jdbc:`）；DB 口令 AES/GCM 加密与公开接口脱敏（`PasswordCipherTest`/`DataSourceServiceTest`）；内部凭据端点不经网关；JWT secret 改为环境变量注入。
+- [x] **WP-07 数值/空间**：取消默认 `setScale(2)`、按列精度、PG `ST_GeomFromEWKT(?,4326)`、MultiPolygon/GeometryCollection、MySQL→PG 类型映射。证据：`NumberScaleTransformerTest`、`GeoJsonToWktTransformerTest`、`TypeMappingTest`。
+- [x] **WP-08 并行消费**：dispatch key=`runId:shardId`；worker 消费组可配置（`etl.worker.consumer-group`）；IT dispatch topic 多分区。证据：`KafkaDispatchPublisherTest`、`TwoWorkerConcurrencyIT`（1 任务 8 分片、2 worker，任务前后 group 分配快照一致、无重复）。
+- [x] **WP-09 测试**：`mvn test` 全反应堆 134 例通过；`-Pit` 43 例通过、**0 skipped**（真 PG/Kafka/Redis，含 `FullChainE2EIT` 真搬 20 行与 `TwoWorkerConcurrencyIT`）。
+- [x] **G-4 口径修正（评审 P1-4）**：对账改为 `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in`，同步 `RunAggregate/GuardChain/§12.2 校验 2/设计文档`；`ConvergencePolicyTest` 与 `ConvergenceGuardIT` 覆盖“崩溃重放 deduped 入账”。
+- [ ] **30M 行 / 20 并发任务 / >100 分片压测**：尚未执行（环境型证据）。
+- [ ] **MySQL→PG / PostGIS 真库回归**：尚未执行（本地 compose 无 MySQL；PostGIS 扩展未纳入 IT 源/目标链路）。
+- [ ] **进程级故障注入**：当前用“目标已提交、checkpoint 未写”等价注入；真实 `kill -9` worker / broker 重启待补。
+- [ ] **安全扫描报告**：Kafka payload 与 DB 加密已有测试；全量日志扫描与 RBAC（cancel/retry/forgive）归 Phase 1B。
+
+> 结论：Phase 1A 的代码与本地可执行验收已收口；Gate 1 的环境型证据（30M 压测、MySQL/PostGIS 回归、进程级故障注入）仍未完成，`etl.routing.new-worker` 继续默认 `false`，不得开启灰度。
+
 ### Phase 1B · 控制面收口与可运维（2~3 周）
 
 > 可在 Phase 1A 后半段并行设计 API/告警/灰度契约，但 Gate 2 必须在 Gate 1 之后。

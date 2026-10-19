@@ -3,30 +3,57 @@ package com.lawyus.dataetl.worker.checkpoint;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+
 /**
  * checkpoint 直写器（worker 是 {@code etl_task_checkpoint} 的唯一写者，写权矩阵 §4.1）。
  *
- * <p>与目标表写入同处 worker 侧；{@code ON CONFLICT (task_id,run_id,shard_id)} 命中
- * {@code ux_checkpoint_shard}，计数用 {@code GREATEST} 保证 {@code rows_*} 单调不减（INV-3），
- * 断点续传不因重放回退。
+ * <p>WP-02/WP-11 的三条约束：
+ * <ul>
+ *   <li><b>chunk 级游标</b>：每个 chunk 写 {@code last_cursor/last_pk}，重试从游标之后续读；</li>
+ *   <li><b>fencing</b>：写入带 {@code shard_attempt}，旧 attempt 的迟到写入被忽略（不把 SUCCEEDED 回退成 RUNNING）；</li>
+ *   <li><b>计数单调</b>：{@code rows_*} 用 {@code GREATEST} 保序，跨 attempt 累计不回退。</li>
+ * </ul>
+ *
+ * <p>同库提交（WP-02）：worker 在同一个 {@code TransactionTemplate} 内调用
+ * {@link #upsert(Connection, String, String, String, String, String, String, int, long, long, long, long, long, String, String)}
+ * 与 {@code JdbcSinkWriter.writeBatch(Connection,...)}，由调用方统一 commit/rollback。
  */
 @Component
 public class CheckpointWriter {
 
     private static final String UPSERT =
             "INSERT INTO etl_task_checkpoint "
-            + "(task_id, run_id, shard_id, status, last_cursor, rows_in, rows_out, rows_dropped, rows_deduped, "
+            + "(task_id, run_id, shard_id, status, shard_attempt, last_cursor, last_pk, "
+            + " rows_in, rows_out, rows_filtered, rows_failed, rows_dropped, rows_deduped, "
             + " error_class, error_detail, updated_at) "
-            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now()) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now()) "
             + "ON CONFLICT (task_id, run_id, shard_id) DO UPDATE SET "
-            + "  status = EXCLUDED.status, "
-            + "  last_cursor = COALESCE(EXCLUDED.last_cursor, etl_task_checkpoint.last_cursor), "
+            // fencing：旧 attempt 的迟到写入整体忽略
+            + "  status = CASE "
+            + "    WHEN EXCLUDED.shard_attempt < etl_task_checkpoint.shard_attempt THEN etl_task_checkpoint.status "
+            // 终态保护：已 SUCCEEDED/FAILED 的分片不允许被同/旧 attempt 回退到 RUNNING/ASSIGNED
+            + "    WHEN etl_task_checkpoint.status IN ('SUCCEEDED','FAILED') "
+            + "         AND EXCLUDED.status IN ('ASSIGNED','RUNNING') THEN etl_task_checkpoint.status "
+            + "    ELSE EXCLUDED.status END, "
+            + "  shard_attempt = GREATEST(etl_task_checkpoint.shard_attempt, EXCLUDED.shard_attempt), "
+            + "  last_cursor = CASE WHEN EXCLUDED.shard_attempt < etl_task_checkpoint.shard_attempt "
+            + "    THEN etl_task_checkpoint.last_cursor ELSE COALESCE(EXCLUDED.last_cursor, etl_task_checkpoint.last_cursor) END, "
+            + "  last_pk = CASE WHEN EXCLUDED.shard_attempt < etl_task_checkpoint.shard_attempt "
+            + "    THEN etl_task_checkpoint.last_pk ELSE COALESCE(EXCLUDED.last_pk, etl_task_checkpoint.last_pk) END, "
             + "  rows_in = GREATEST(etl_task_checkpoint.rows_in, EXCLUDED.rows_in), "
             + "  rows_out = GREATEST(etl_task_checkpoint.rows_out, EXCLUDED.rows_out), "
+            + "  rows_filtered = GREATEST(etl_task_checkpoint.rows_filtered, EXCLUDED.rows_filtered), "
+            + "  rows_failed = GREATEST(etl_task_checkpoint.rows_failed, EXCLUDED.rows_failed), "
             + "  rows_dropped = GREATEST(etl_task_checkpoint.rows_dropped, EXCLUDED.rows_dropped), "
             + "  rows_deduped = GREATEST(etl_task_checkpoint.rows_deduped, EXCLUDED.rows_deduped), "
-            + "  error_class = EXCLUDED.error_class, "
-            + "  error_detail = EXCLUDED.error_detail, "
+            + "  error_class = CASE WHEN EXCLUDED.shard_attempt < etl_task_checkpoint.shard_attempt "
+            + "    THEN etl_task_checkpoint.error_class ELSE EXCLUDED.error_class END, "
+            + "  error_detail = CASE WHEN EXCLUDED.shard_attempt < etl_task_checkpoint.shard_attempt "
+            + "    THEN etl_task_checkpoint.error_detail ELSE EXCLUDED.error_detail END, "
             + "  updated_at = now()";
 
     private final JdbcTemplate jdbcTemplate;
@@ -35,10 +62,58 @@ public class CheckpointWriter {
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    public void upsert(String taskId, String runId, String shardId, String status,
-                       String lastCursor, long rowsIn, long rowsOut, long rowsDropped, long rowsDeduped,
+    /** JdbcTemplate 入口：参与调用方事务（若在 TransactionTemplate 内）。 */
+    public void upsert(String taskId, String runId, String shardId, String status, String lastCursor,
+                       long rowsIn, long rowsOut, long rowsDropped, long rowsDeduped,
                        String errorClass, String errorDetail) {
-        jdbcTemplate.update(UPSERT, taskId, runId, shardId, status, lastCursor,
-                rowsIn, rowsOut, rowsDropped, rowsDeduped, errorClass, errorDetail);
+        // 兼容旧签名：rowsDropped 视为业务过滤（旧口径），attempt=0
+        upsert(taskId, runId, shardId, status, lastCursor, null, 0,
+                rowsIn, rowsOut, rowsDropped, 0, rowsDropped, rowsDeduped, errorClass, errorDetail);
+    }
+
+    /** JdbcTemplate 入口：完整字段（参与调用方事务）。 */
+    public void upsert(String taskId, String runId, String shardId, String status, String lastCursor,
+                       String lastPk, int shardAttempt,
+                       long rowsIn, long rowsOut, long rowsFiltered, long rowsFailed, long rowsDropped,
+                       long rowsDeduped, String errorClass, String errorDetail) {
+        jdbcTemplate.update(UPSERT, taskId, runId, shardId, status, shardAttempt, lastCursor, lastPk,
+                rowsIn, rowsOut, rowsFiltered, rowsFailed, rowsDropped, rowsDeduped, errorClass, errorDetail);
+    }
+
+    /**
+     * 显式连接入口（WP-02 同库同事务）：用于调用方已持有事务连接的场景，避免 JdbcTemplate
+     * 在无事务上下文时另取连接。
+     */
+    public void upsert(Connection conn, String taskId, String runId, String shardId, String status,
+                       String lastCursor, String lastPk, int shardAttempt,
+                       long rowsIn, long rowsOut, long rowsFiltered, long rowsFailed, long rowsDropped,
+                       long rowsDeduped, String errorClass, String errorDetail) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(UPSERT)) {
+            ps.setString(1, taskId);
+            ps.setString(2, runId);
+            ps.setString(3, shardId);
+            ps.setString(4, status);
+            ps.setInt(5, shardAttempt);
+            ps.setString(6, lastCursor);
+            ps.setString(7, lastPk);
+            ps.setLong(8, rowsIn);
+            ps.setLong(9, rowsOut);
+            ps.setLong(10, rowsFiltered);
+            ps.setLong(11, rowsFailed);
+            ps.setLong(12, rowsDropped);
+            ps.setLong(13, rowsDeduped);
+            ps.setString(14, errorClass);
+            ps.setString(15, errorDetail);
+            ps.executeUpdate();
+        }
+    }
+
+    /** lease 续约（WP-11）：仅当仍由本 worker/attempt 持有。 */
+    public int renewLease(String taskId, String runId, String shardId, String leaseOwner,
+                          int shardAttempt, Timestamp leaseUntil) {
+        return jdbcTemplate.update(
+                "UPDATE etl_task_checkpoint SET lease_owner = ?, lease_until = ?, updated_at = now() "
+                        + "WHERE task_id = ? AND run_id = ? AND shard_id = ? AND shard_attempt = ?",
+                leaseOwner, leaseUntil, taskId, runId, shardId, shardAttempt);
     }
 }

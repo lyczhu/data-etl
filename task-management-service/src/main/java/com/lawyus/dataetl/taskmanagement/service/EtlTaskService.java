@@ -71,9 +71,9 @@ public class EtlTaskService {
         task.setTargetTableName(uniqueTableName);
         EtlTask saved = etlTaskRepository.save(task);
 
-        // 影子切换（orchestrator-design.md §7.1/§11.2）：新链路开启时建 run + 校验入队；
+        // 影子切换（orchestrator-design.md §7.1/§11.2 + v2 WP-16）：总开关 + dataSource 白名单；
         // 关闭时保持旧行为（status="new" 由旧 TaskScheduler 驱动），e2e 零影响。
-        if (routing.isNewWorker()) {
+        if (routing.isNewWorkerFor(saved.getDataSourceId())) {
             submitToStateMachine(saved.getTaskId());
         }
         return saved;

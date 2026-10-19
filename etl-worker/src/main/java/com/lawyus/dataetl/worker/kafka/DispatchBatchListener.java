@@ -28,7 +28,8 @@ public class DispatchBatchListener {
         this.executor = executor;
     }
 
-    @KafkaListener(topics = "${etl.topics.dispatch-batch:etl.task.dispatch.batch}", groupId = "etl-worker")
+    @KafkaListener(topics = "${etl.topics.dispatch-batch:etl.task.dispatch.batch}",
+            groupId = "${etl.worker.consumer-group:etl-worker}")
     public void onDispatch(String payload) {
         ShardDispatch dispatch;
         try {
@@ -37,7 +38,11 @@ public class DispatchBatchListener {
             log.warn("illegal dispatch payload, skip (poison guard): {}", parseFail.getMessage());
             return;   // ack 并跳过，绝不重试整批
         }
+        // §6.1/B1：日志 MDC 带上 taskId/runId/shardId/attemptNo，按 taskId 可直查整条分片链路
         MDC.put("taskId", dispatch.getTaskId());
+        MDC.put("runId", dispatch.getRunId());
+        MDC.put("shardId", dispatch.getShardId());
+        MDC.put("attemptNo", String.valueOf(dispatch.getAttemptNo()));
         try {
             executor.execute(dispatch);
         } catch (RuntimeException e) {
@@ -46,6 +51,9 @@ public class DispatchBatchListener {
                     dispatch.getRunId(), dispatch.getShardId(), e.getMessage(), e);
         } finally {
             MDC.remove("taskId");
+            MDC.remove("runId");
+            MDC.remove("shardId");
+            MDC.remove("attemptNo");
         }
     }
 }

@@ -12,10 +12,11 @@ import java.util.Map;
 
 /**
  * GeoJSON → WKT：把文本列里的 GeoJSON 几何（{@code Point}/{@code LineString}/{@code Polygon}/
- * {@code MultiPoint}/{@code MultiLineString}）转成 PostGIS 可直接入表的 WKT 字面量。
- * 面向 {@code FILE_GEOJSON} 源与 {@code PostGIS} 目标（方案 §7.3 E）。
+ * {@code MultiPoint}/{@code MultiLineString}/{@code MultiPolygon}/{@code GeometryCollection}）
+ * 转成 PostGIS 可直接入表的 WKT 字面量。面向 {@code FILE_GEOJSON} 源与 {@code PostGIS} 目标（方案 v2 WP-07）。
  *
  * <p>非 GeoJSON 值（不以 {@code {"type"} 开头或解析失败）原样保留，不误伤普通文本。纯函数、可单测。
+ * SRID 由 sink 写入时统一加 {@code SRID=4326} 前缀（{@code JdbcSinkWriter}）。
  */
 public class GeoJsonToWktTransformer implements RecordTransformer {
 
@@ -41,7 +42,8 @@ public class GeoJsonToWktTransformer implements RecordTransformer {
 
     static boolean looksLikeGeoJson(String s) {
         String t = s.trim();
-        return t.startsWith("{") && t.contains("\"type\"") && t.contains("\"coordinates\"");
+        return t.startsWith("{") && t.contains("\"type\"")
+                && (t.contains("\"coordinates\"") || t.contains("\"geometries\""));
     }
 
     /** 可见以便单测：解析失败返回 {@code null}（调用方保留原值）。 */
@@ -49,8 +51,26 @@ public class GeoJsonToWktTransformer implements RecordTransformer {
         try {
             JsonNode node = mapper.readTree(geoJson);
             String type = node.path("type").asText(null);
+            if (type == null) {
+                return null;
+            }
+            if ("GeometryCollection".equals(type)) {
+                JsonNode geometries = node.path("geometries");
+                if (!geometries.isArray()) {
+                    return null;
+                }
+                List<String> parts = new ArrayList<>();
+                for (JsonNode g : geometries) {
+                    String wkt = toWkt(g.toString());
+                    if (wkt == null) {
+                        return null;
+                    }
+                    parts.add(wkt);
+                }
+                return "GEOMETRYCOLLECTION (" + String.join(", ", parts) + ")";
+            }
             JsonNode coords = node.path("coordinates");
-            if (type == null || coords.isMissingNode()) {
+            if (coords.isMissingNode()) {
                 return null;
             }
             switch (type) {
@@ -64,6 +84,8 @@ public class GeoJsonToWktTransformer implements RecordTransformer {
                     return "POLYGON ((" + ringList(coords) + "))";
                 case "MultiLineString":
                     return "MULTILINESTRING ((" + ringList(coords) + "))";
+                case "MultiPolygon":
+                    return "MULTIPOLYGON (" + polygonList(coords) + ")";
                 default:
                     return null;
             }
@@ -92,6 +114,15 @@ public class GeoJsonToWktTransformer implements RecordTransformer {
             rings.add(pointList(ring));
         }
         return String.join(", ", rings);
+    }
+
+    /** 三层嵌套：MultiPolygon 的每个 polygon 是一个环集合。 */
+    private static String polygonList(JsonNode arr) {
+        List<String> polygons = new ArrayList<>();
+        for (JsonNode polygon : arr) {
+            polygons.add("((" + ringList(polygon) + "))");
+        }
+        return String.join(", ", polygons);
     }
 
     private static String trimNum(double d) {

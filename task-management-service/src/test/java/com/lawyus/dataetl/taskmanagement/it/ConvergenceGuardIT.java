@@ -48,7 +48,7 @@ class ConvergenceGuardIT extends AbstractOrchestratorIT {
         assertThatThrownBy(() -> orchestrator.transition(runId, RUNNING, SUCCEEDED,
                 ctx(taskId).reason("IT_G4").maxAttempts(orchProps.getMaxAttempts()).build()))
                 .isInstanceOf(GuardFailureException.class)
-                .hasMessageContaining("rows_out + rows_dropped != rows_in");
+                .hasMessageContaining("rows_out + rows_filtered + rows_failed + rows_deduped != rows_in");
         assertThat(guardFailure("G-4_BALANCE") - before).isEqualTo(1.0);
         assertThat(runStatus(runId)).isEqualTo(RUNNING);
 
@@ -67,24 +67,25 @@ class ConvergenceGuardIT extends AbstractOrchestratorIT {
     }
 
     @Test
-    @DisplayName("dedup 跨 attempt：第二次全 ON CONFLICT 命中，等式仍平，能进 SUCCEEDED（D-08）")
+    @DisplayName("dedup 跨 attempt：重放读入的行计入 rows_in，幂等命中计入 deduped，等式仍平并可进 SUCCEEDED")
     void dedupAcrossAttemptKeepsBalanceAndReachesSuccess() {
         String taskId = seedTask(ItInfra.SOURCE_TABLE, "it_target_dedup");
         String runId = seedRun(taskId, RUNNING, 1, 1);
-        // attempt 1 写 100 行；attempt 2 重放全部 ON CONFLICT DO NOTHING → 只有 deduped 增长
-        seedCheckpoint(taskId, runId, "shard-0", EtlShardStatus.SUCCEEDED, 100, 100, 0, 100L, null);
+        // attempt 1 读 100 行全部写入；attempt 2 从更早的游标重放同一批行（rows_in 再涨 100），
+        // 目标 100 行全部 ON CONFLICT DO NOTHING → rows_out 仍为 100，deduped=100。
+        seedCheckpoint(taskId, runId, "shard-0", EtlShardStatus.SUCCEEDED, 200, 100, 0, 100L, null);
 
         RunAggregate aggregate = checkpointRepository.aggregate(runId);
-        assertThat(aggregate.isBalanced()).as("rows_deduped 不入对账等式").isTrue();
+        assertThat(aggregate.isBalanced()).as("rows_out + rows_filtered + rows_failed + rows_deduped = rows_in")
+                .isTrue();
 
         orchestrator.transition(runId, RUNNING, SUCCEEDED,
                 ctx(taskId).reason("ALL_SHARDS_OK").maxAttempts(orchProps.getMaxAttempts()).build());
         assertThat(runStatus(runId)).isEqualTo(SUCCEEDED);
         assertThat(taskStatus(taskId)).isEqualTo("SUCCEEDED");
         assertThat(runDateColumn(runId, "finished_at")).isNotNull();
-        // rows_deduped 不入对账等式，但它是 run 行的一个真实列：不投影则它永远停在 0
         assertThat(runLongColumn(runId, "rows_deduped")).as("幂等命中数也投影").isEqualTo(100L);
-        assertThat(runLongColumn(runId, "rows_in")).isEqualTo(100L);
+        assertThat(runLongColumn(runId, "rows_in")).isEqualTo(200L);
         assertThat(runLongColumn(runId, "rows_out")).isEqualTo(100L);
     }
 
@@ -163,7 +164,7 @@ class ConvergenceGuardIT extends AbstractOrchestratorIT {
     }
 
     @Test
-    @DisplayName("T24/T25 人工出口：NEEDS_ATTENTION 可回 QUEUED 重排、可回 RUNNING 续跑（不改 attempt）")
+    @DisplayName("T24/T25 人工出口：NEEDS_ATTENTION 可回 QUEUED 重排（推进 attempt）、可回 RUNNING 续跑")
     void humanExitsFromNeedsAttention() {
         RunFixture retry = seedRunFixture(NEEDS_ATTENTION, 2, 1);
         seedCheckpoint(retry.taskId(), retry.runId(), "shard-0", EtlShardStatus.FAILED, 10, 0, 0, 0L, "PERSISTENT");
@@ -171,8 +172,10 @@ class ConvergenceGuardIT extends AbstractOrchestratorIT {
         orchestrator.transition(retry.runId(), NEEDS_ATTENTION, QUEUED,
                 ctx(retry.taskId()).reason("HUMAN_RETRY").build());
         assertThat(runStatus(retry.runId())).isEqualTo(QUEUED);
-        assertThat(attemptNo(retry.runId())).isEqualTo(2);   // 人工重排不自增 attempt
+        // 人工重排是新 attempt：推进 fencing，旧 worker 的迟到写入必须被忽略
+        assertThat(attemptNo(retry.runId())).isEqualTo(3);
         assertThat(runColumn(retry.runId(), "queued_reason")).isEqualTo("SCHEDULED");
+        assertThat(shardStatus(retry.runId(), "shard-0")).isEqualTo("PENDING");
 
         RunFixture resume = seedRunFixture(NEEDS_ATTENTION, 2, 1);
         orchestrator.transition(resume.runId(), NEEDS_ATTENTION, RUNNING,

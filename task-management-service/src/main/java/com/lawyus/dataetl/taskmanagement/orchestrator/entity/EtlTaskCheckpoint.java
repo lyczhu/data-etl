@@ -69,8 +69,22 @@ public class EtlTaskCheckpoint {
     @Column(name = "rows_dropped", nullable = false)
     private Long rowsDropped;
 
+    /** 业务规则过滤（transformer 返回 null），可进成功等式（WP-04）。 */
+    @Column(name = "rows_filtered", nullable = false)
+    private Long rowsFiltered;
+
+    /** 写入/解析失败（已落 DLT），>0 时禁止 SUCCEEDED（WP-04）。 */
+    @Column(name = "rows_failed", nullable = false)
+    private Long rowsFailed;
+
     @Column(name = "rows_deduped", nullable = false)
     private Long rowsDeduped;
+
+    @Column(name = "lease_owner", length = 128)
+    private String leaseOwner;
+
+    @Column(name = "lease_until")
+    private Date leaseUntil;
 
     @Column(name = "error_class", length = 24)
     private String errorClass;
@@ -106,6 +120,8 @@ public class EtlTaskCheckpoint {
         c.rowsIn = 0L;
         c.rowsOut = 0L;
         c.rowsDropped = 0L;
+        c.rowsFiltered = 0L;
+        c.rowsFailed = 0L;
         c.rowsDeduped = 0L;
         c.updatedAt = new Date();
         return c;
@@ -179,8 +195,24 @@ public class EtlTaskCheckpoint {
         return rowsDropped;
     }
 
+    public Long getRowsFiltered() {
+        return rowsFiltered;
+    }
+
+    public Long getRowsFailed() {
+        return rowsFailed;
+    }
+
     public Long getRowsDeduped() {
         return rowsDeduped;
+    }
+
+    public String getLeaseOwner() {
+        return leaseOwner;
+    }
+
+    public Date getLeaseUntil() {
+        return leaseUntil;
     }
 
     public String getErrorClass() {

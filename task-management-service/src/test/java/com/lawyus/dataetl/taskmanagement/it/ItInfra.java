@@ -71,9 +71,18 @@ public final class ItInfra {
     public static final String TOPIC_RESULTS = RUN_TAG + ".etl.task.results";
     public static final String TOPIC_DLT = RUN_TAG + ".etl.task.dlt";
     public static final String[] IT_TOPICS = {TOPIC_DISPATCH, TOPIC_PROGRESS, TOPIC_RESULTS, TOPIC_DLT};
+    /** dispatch 分区数：Gate1 #9（1 任务 8 分片、2 worker）需要同组消费者能分担多个分区。 */
+    public static final int DISPATCH_PARTITIONS = 8;
+    /**
+     * IT worker 的消费组（每次 JVM 唯一）。worker 的 {@code @KafkaListener} 从
+     * {@code etl.worker.consumer-group} 读取；不能沿用生产默认 {@code etl-worker}，否则会与本地
+     * 正在运行的 e2e worker 混组——两者订阅不同 topic，group 会无限 rebalance。
+     */
+    public static final String WORKER_GROUP = RUN_TAG + "-etl-worker";
 
     private static final String[] SCHEMA_SCRIPTS = {
-            "02-create-tables.sql", "05-etl-task-run.sql", "06-etl-task-checkpoint.sql"};
+            "02-create-tables.sql", "05-etl-task-run.sql", "06-etl-task-checkpoint.sql",
+            "07-etl-task-dlt.sql"};
 
     private static final AtomicBoolean BOOTSTRAPPED = new AtomicBoolean(false);
 
@@ -111,8 +120,10 @@ public final class ItInfra {
     }
 
     /**
-     * 显式建出本 JVM 专用的 IT topic（1 分区，保证单 run 的消息顺序），不依赖 broker 的
-     * auto-create 与默认分区数。幂等：已存在则忽略。
+     * 显式建出本 JVM 专用的 IT topic，不依赖 broker 的 auto-create 与默认分区数。
+     * dispatch topic 用多分区：Gate1 #9 要在一个任务 8 分片下让 2 个 worker 真正分担消费；
+     * 同一 shard 的消息仍按 {@code runId:shardId} key 保序。其它 topic 保持 1 分区（顺序/位点断言简单）。
+     * 幂等：已存在则忽略。
      */
     public static void ensureItTopics() {
         java.util.Properties props = new java.util.Properties();
@@ -122,7 +133,8 @@ public final class ItInfra {
                      org.apache.kafka.clients.admin.AdminClient.create(props)) {
             List<org.apache.kafka.clients.admin.NewTopic> topics = new ArrayList<>();
             for (String topic : IT_TOPICS) {
-                topics.add(new org.apache.kafka.clients.admin.NewTopic(topic, 1, (short) 1));
+                int partitions = topic.equals(TOPIC_DISPATCH) ? DISPATCH_PARTITIONS : 1;
+                topics.add(new org.apache.kafka.clients.admin.NewTopic(topic, partitions, (short) 1));
             }
             admin.createTopics(topics).all().get(30, TimeUnit.SECONDS);
         } catch (org.apache.kafka.common.errors.TopicExistsException exists) {
@@ -161,7 +173,7 @@ public final class ItInfra {
                                 StandardCharsets.UTF_8));
             }
         } catch (SQLException | IOException e) {
-            throw new IllegalStateException("IT 库 DDL 初始化失败（db/schema 02/05/06）", e);
+            throw new IllegalStateException("IT 库 DDL 初始化失败（db/schema 02/05/06/07）", e);
         }
     }
 
@@ -184,7 +196,7 @@ public final class ItInfra {
                 for (String table : itTables) {
                     st.execute("DROP TABLE IF EXISTS \"" + table + "\" CASCADE");
                 }
-                st.execute("TRUNCATE TABLE data_source, etl_task, etl_task_run, etl_task_checkpoint "
+                st.execute("TRUNCATE TABLE data_source, etl_task, etl_task_run, etl_task_checkpoint, etl_task_dlt "
                         + "RESTART IDENTITY CASCADE");
             }
             seedSourceTable(conn);

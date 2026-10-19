@@ -51,6 +51,36 @@ class ShardRangesTest {
         assertThat(r.get(0)).containsExactly(1, 4);
     }
 
+    @Test
+    @DisplayName("按并行度切：小表按 span 收敛，不产生超过行数的空片")
+    void splitByParallelismSmallTable() {
+        List<long[]> r = ShardRanges.splitByParallelism(1, 20, 16, 5000);
+        assertThat(r).hasSize(10);   // ceil(20/16)=2 行/片 → 10 片
+        assertThat(r.get(0)).containsExactly(1, 2);
+        assertThat(r.get(r.size() - 1)).containsExactly(19, 20);
+        assertContiguous(r, 1, 20);
+    }
+
+    @Test
+    @DisplayName("按并行度切：大表默认 16 片，chunk 只作分片内事务单元")
+    void splitByParallelismLargeTable() {
+        List<long[]> r = ShardRanges.splitByParallelism(1, 30_000_000, 16, 5000);
+        assertThat(r).hasSize(16);
+        assertThat(r.get(0)).containsExactly(1, 1_875_000);
+        assertThat(r.get(15)).containsExactly(28_125_001, 30_000_000);
+        assertContiguous(r, 1, 30_000_000);
+    }
+
+    @Test
+    @DisplayName("按并行度切：desiredShards 超过 span 时自动收敛")
+    void splitByParallelismMoreShardsThanRows() {
+        List<long[]> r = ShardRanges.splitByParallelism(1, 5, 100, 5000);
+        assertThat(r).hasSize(5);
+        for (int i = 0; i < 5; i++) {
+            assertThat(r.get(i)).containsExactly(i + 1, i + 1);
+        }
+    }
+
     private static void assertContiguous(List<long[]> ranges, long min, long max) {
         long cur = min;
         for (long[] rg : ranges) {

@@ -7,15 +7,23 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.TimeUnit;
+
 /**
- * {@link DispatchPublisher} 的 Kafka 实现（Phase 1 直投，{@code orchestrator-design.md §6.3}）。
- * 发送失败仅记 ERROR（弱 at-least-once），由 sweeper（T8 心跳超时回退）与收敛重算兜底——派工丢失
- * 表现为该 shard 停在 ASSIGNED/PENDING，最终被 DispatchTimeoutSweeper 拉回重派，不产生错误终态。
+ * {@link DispatchPublisher} 的 Kafka 实现（方案 v2 WP-08 / D6 / P0-3）。
+ *
+ * <ul>
+ *   <li>key = {@code runId:shardId}：同一 task 的不同分片分散到不同分区，修复 I1 单任务串行；</li>
+ *   <li>发送<b>等待 broker ack</b>（{@code send(...).get(timeout)}）：失败抛异常，由 DispatchService
+ *       保持 PENDING、不标 ASSIGNED，下轮补派；</li>
+ *   <li>Phase 1B 切最小 outbox 后，本类可保持不变（publisher 接口不变）。</li>
+ * </ul>
  */
 @Component
 public class KafkaDispatchPublisher implements DispatchPublisher {
 
     private static final Logger log = LoggerFactory.getLogger(KafkaDispatchPublisher.class);
+    private static final long ACK_TIMEOUT_SECONDS = 5;
 
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
@@ -33,10 +41,15 @@ public class KafkaDispatchPublisher implements DispatchPublisher {
     public void publish(ShardDispatchCommand command) {
         try {
             String payload = objectMapper.writeValueAsString(command);
-            kafkaTemplate.send(topic, command.getTaskId(), payload);
+            kafkaTemplate.send(topic, key(command), payload).get(ACK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (Exception e) {
             log.error("dispatch publish failed run={} shard={}: {}",
                     command.getRunId(), command.getShardId(), e.getMessage(), e);
+            throw new IllegalStateException("dispatch publish failed for shard " + command.getShardId(), e);
         }
+    }
+
+    private static String key(ShardDispatchCommand command) {
+        return command.getRunId() + ":" + command.getShardId();
     }
 }

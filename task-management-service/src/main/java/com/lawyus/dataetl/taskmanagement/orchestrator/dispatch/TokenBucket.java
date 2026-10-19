@@ -24,7 +24,7 @@ public class TokenBucket {
         this.semaphore = new Semaphore(this.capacity, true);
     }
 
-    /** 非阻塞申请 {@code permits} 个许可；不足则回滚申请并返回 false。 */
+    /** 非阻塞申请 {@code permits} 个许可；不足则回滚申请并返回 false（全有或全无，保留旧语义）。 */
     public boolean tryAcquire(int permits) {
         if (permits <= 0) {
             return true;
@@ -33,6 +33,21 @@ public class TokenBucket {
             return true;
         }
         return false;
+    }
+
+    /**
+     * 尽量申请（WP-01 / P1-6）：返回实际获得的许可数（0..desired）。
+     * 不再“有 3 个空闲、需要 8 个就饿死”，令牌不足时部分派工。
+     */
+    public int tryAcquireUpTo(int desired) {
+        if (desired <= 0) {
+            return 0;
+        }
+        int acquired = 0;
+        while (acquired < desired && semaphore.tryAcquire(1)) {
+            acquired++;
+        }
+        return acquired;
     }
 
     /** 归还 {@code permits} 个许可（分片进入终态时调用）。 */

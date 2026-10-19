@@ -43,12 +43,14 @@ class RunCounterProjectorTest {
             @Override public Long getRowsIn() { return rowsIn; }
             @Override public Long getRowsOut() { return rowsOut; }
             @Override public Long getRowsDropped() { return rowsDropped; }
+            @Override public Long getRowsFiltered() { return rowsDropped; }
+            @Override public Long getRowsFailed() { return 0L; }
             @Override public Long getRowsDeduped() { return rowsDeduped; }
         };
     }
 
     @Test
-    @DisplayName("聚合值逐列绝对覆写到 run 行（含 rows_deduped，不入对账等式但要留痕）")
+    @DisplayName("聚合值逐列绝对覆写到 run 行（含 rows_deduped，参与对账也要留痕）")
     void projectsAggregateAsAbsoluteValues() {
         projector.project("run-1", agg(3, 1, 2, 100, 90, 5, 7));
 
@@ -69,6 +71,8 @@ class RunCounterProjectorTest {
             @Override public Long getRowsIn() { return null; }
             @Override public Long getRowsOut() { return null; }
             @Override public Long getRowsDropped() { return null; }
+            @Override public Long getRowsFiltered() { return null; }
+            @Override public Long getRowsFailed() { return null; }
             @Override public Long getRowsDeduped() { return null; }
         };
 

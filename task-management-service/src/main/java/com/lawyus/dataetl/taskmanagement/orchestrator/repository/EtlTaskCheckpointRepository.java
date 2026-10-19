@@ -38,10 +38,12 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
             + " COALESCE(SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END), 0) AS succeeded, "
             + " COALESCE(SUM(CASE WHEN status = 'FAILED'    THEN 1 ELSE 0 END), 0) AS failed,    "
             + " COALESCE(SUM(CASE WHEN status = 'SKIPPED'   THEN 1 ELSE 0 END), 0) AS skipped,   "
-            + " COALESCE(SUM(rows_in), 0)      AS rowsIn,      "
-            + " COALESCE(SUM(rows_out), 0)     AS rowsOut,     "
-            + " COALESCE(SUM(rows_dropped), 0) AS rowsDropped, "
-            + " COALESCE(SUM(rows_deduped), 0) AS rowsDeduped  "
+            + " COALESCE(SUM(rows_in), 0)       AS rowsIn,       "
+            + " COALESCE(SUM(rows_out), 0)      AS rowsOut,      "
+            + " COALESCE(SUM(rows_dropped), 0)  AS rowsDropped,  "
+            + " COALESCE(SUM(rows_filtered), 0) AS rowsFiltered, "
+            + " COALESCE(SUM(rows_failed), 0)   AS rowsFailed,   "
+            + " COALESCE(SUM(rows_deduped), 0)  AS rowsDeduped   "
             + "FROM etl_task_checkpoint WHERE run_id = :runId",
             nativeQuery = true)
     RunAggregate aggregate(@Param("runId") String runId);
@@ -50,6 +52,10 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
     @Query("SELECT COUNT(c) FROM EtlTaskCheckpoint c "
             + "WHERE c.runId = :runId AND c.status IN ('ASSIGNED','RUNNING')")
     long countActiveShards(@Param("runId") String runId);
+
+    /** 全局活跃分片数（WP-12：替代 JVM Semaphore 的全局许可真源）。 */
+    @Query("SELECT COUNT(c) FROM EtlTaskCheckpoint c WHERE c.status IN ('ASSIGNED','RUNNING')")
+    long countActiveShardsGlobal();
 
     /** 卡死判定（§7.9）：本 run 分片最近一次写入时间（无分片时为 null）。 */
     @Query("SELECT MAX(c.updatedAt) FROM EtlTaskCheckpoint c WHERE c.runId = :runId")
@@ -79,14 +85,37 @@ public interface EtlTaskCheckpointRepository extends JpaRepository<EtlTaskCheckp
     @Query("SELECT COUNT(c) FROM EtlTaskCheckpoint c WHERE c.runId = :runId AND c.status = 'PENDING'")
     long countPendingShards(@Param("runId") String runId);
 
+    /** T31 幂等重放（WP-10/P1-2）：清掉旧计划后重建，避免撞 ux_checkpoint_shard。 */
+    @Modifying(clearAutomatically = true)
+    @Query("DELETE FROM EtlTaskCheckpoint c WHERE c.runId = :runId")
+    int deleteByRunId(@Param("runId") String runId);
+
     /**
      * 派工阶段 {@code PENDING → ASSIGNED}（§4.1 写权矩阵：这是编排器唯二合法的 checkpoint 写之一——
      * 另者为 {@code /retry}/{@code /abort} 的重置）。以 {@code status='PENDING'} 作 CAS 条件，
      * 只有真正从 PENDING 转出才返回 1，避免并发重复派工。
      */
     @Modifying(clearAutomatically = true)
-    @Query("UPDATE EtlTaskCheckpoint c SET c.status = 'ASSIGNED', c.updatedAt = CURRENT_TIMESTAMP "
+    @Query("UPDATE EtlTaskCheckpoint c SET c.status = 'ASSIGNED', c.shardAttempt = :attempt, "
+            + "c.updatedAt = CURRENT_TIMESTAMP "
             + "WHERE c.taskId = :taskId AND c.runId = :runId AND c.shardId = :shardId AND c.status = 'PENDING'")
     int markAssigned(@Param("taskId") String taskId, @Param("runId") String runId,
-                     @Param("shardId") String shardId);
+                     @Param("shardId") String shardId, @Param("attempt") int attempt);
+
+    /**
+     * 任务级重试（T12/T17/WP-05）：把 FAILED 分片重置为 PENDING，并把 fencing 推进到新 attempt；
+     * last_cursor 保留，worker 从断点之后续跑。
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE EtlTaskCheckpoint c SET c.status = 'PENDING', c.shardAttempt = :attempt, "
+            + "c.errorClass = NULL, c.errorDetail = NULL, c.updatedAt = CURRENT_TIMESTAMP "
+            + "WHERE c.runId = :runId AND c.status = 'FAILED'")
+    int resetFailedShards(@Param("runId") String runId, @Param("attempt") int attempt);
+
+    /** 人工重试（NEEDS_ATTENTION→QUEUED）：所有非 SUCCEEDED 分片重置为 PENDING。 */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE EtlTaskCheckpoint c SET c.status = 'PENDING', c.shardAttempt = :attempt, "
+            + "c.errorClass = NULL, c.errorDetail = NULL, c.updatedAt = CURRENT_TIMESTAMP "
+            + "WHERE c.runId = :runId AND c.status IN ('FAILED','SKIPPED')")
+    int resetRetryableShards(@Param("runId") String runId, @Param("attempt") int attempt);
 }

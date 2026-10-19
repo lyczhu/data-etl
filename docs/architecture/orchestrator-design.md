@@ -218,7 +218,7 @@ stateDiagram-v2
 | T7 | `DISPATCHED` → `RUNNING` | WRK | 收到该 run 任一 shard 心跳；CAS `status=DISPATCHED` | `started_at=now`（仅首次）；`last_progress_ts` |
 | T8 | `DISPATCHED` → `QUEUED` | SWP | `now - dispatched_at > 60s` ∧ **该 run 无 `ASSIGNED/RUNNING` shard**（quiesce 检查） ∧ `attempt_no < maxAttempts` | `attempt_no+1`；`next_attempt_at=now+backoff`；shard `ASSIGNED→PENDING`；audit |
 | T9 | `DISPATCHED` → `NEEDS_ATTENTION` | SWP | 60s 无心跳 ∧ `attempt_no >= maxAttempts` | `error_summary`；DLT 关联；audit |
-| T10 | `RUNNING` → `SUCCEEDED` | WRK→ORCH | **G-4**：`shard_failed=0 ∧ shard_skipped=0 ∧ 所有 shard ∈ {SUCCEEDED}` ∧ `rows_out + rows_dropped = rows_in`（§7.5） | `finished_at`；`is_current` 保持 TRUE；audit |
+| T10 | `RUNNING` → `SUCCEEDED` | WRK→ORCH | **G-4**：`shard_failed=0 ∧ shard_skipped=0 ∧ 所有 shard ∈ {SUCCEEDED}` ∧ `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in`（§7.5） | `finished_at`；`is_current` 保持 TRUE；audit |
 | T11 | `RUNNING` → `PARTIAL_SUCCESS` | WRK→ORCH | **G-2**：`shard_failed ≥ 1` ∧ 其余 shard ∈ {`SUCCEEDED`,`SKIPPED`} | 汇总 `shard_*`；`error_summary`；audit |
 | T12 | `RUNNING` → `RETRYING` | WRK | `errorClass=PERSISTENT` ∧ `attempt_no < maxAttempts` ∧ quiesce（无 shard 在跑） | `attempt_no+1`；`next_attempt_at=now+backoff(attempt)`；audit |
 | T13 | `RUNNING` → `NEEDS_ATTENTION` | WRK/SWP | `errorClass=FATAL` ∨ 未 `resolved` 的 DLT 行数 > 0 ∨ `STALLED` 成立 ∨ 人工暂停标记 | `error_summary`；告警；audit |
@@ -261,7 +261,7 @@ stateDiagram-v2
 | INV-1 | 同一 `task_id` 至多一个 `is_current=TRUE` 且非终态的 run | `ux_run_task_current`（DB） |
 | INV-2 | `(task_id, run_id, shard_id)` 唯一 | `ux_checkpoint_shard`（DB） |
 | INV-3 | checkpoint 的 `rows_in/rows_out` 单调不减 | worker 写 SQL 用 `GREATEST(旧值, 新值)`；nightly 校验比对 `updated_at` 序 |
-| INV-4 | `SUCCEEDED` 的 run 必然 `rows_out + rows_dropped = rows_in` | G-4 前置 + §12.2 校验 SQL（校验 2） |
+| INV-4 | `SUCCEEDED` 的 run 必然 `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in` | G-4 前置 + §12.2 校验 SQL（校验 2） |
 | INV-5 | `RETRYING` 期间不存在 `ASSIGNED/RUNNING` shard | quiesce guard（T12/T21）+ sweeper 复核 |
 | INV-6 | `etl_task.status` 恒等于 current run 的 status | 只经 `refreshDerivedStatus()` 写；§12.2 校验 SQL（校验 1） |
 | INV-7 | `attempt_no` 单调不减，且自动重试次数 ≤ `maxAttempts(=3)` | `ux_run_task_attempt`（**部分索引，仅 `is_current`**；否则与 T1「新建 run 归 1」冲突）+ guard；人工 `/retry` `/resume` 不计入（§7.8） |
@@ -276,7 +276,7 @@ stateDiagram-v2
 | 1 终态不可回退；NEEDS_ATTENTION 仅经 `/retry` `/resume` 迁出 | 禁止清单 #1 + T24/T25/T26 | **扩为三个出口**，`/abort` 目标改为 `FAILED`（非 CANCELLED），见 D-02 |
 | 2 `RUNNING → PARTIAL_SUCCESS` 需存在 FAILED 分片且其余 SUCCEEDED | G-2（T11） | 允许其余分片为 `SKIPPED`（人工跳过的毒分片），否则宽恕后无法收敛 |
 | 3 `DISPATCHED → RUNNING` 由首次心跳确认；60s 无心跳回退 `QUEUED` 且 `attemptNo+1` | T7/T8/T9 | **加 quiesce 前置**（防 shard 双跑）；attempt 耗尽时改落 `NEEDS_ATTENTION` 而非无限回退 |
-| 4 `RUNNING → SUCCEEDED` 需所有 shard SUCCEEDED 且 `rowsOut == rowsIn - rowsDropped` | G-4（T10） | 等式改写为 `rows_out + rows_dropped = rows_in`，并把 `rows_deduped` 排除在外，见 D-08 |
+| 4 `RUNNING → SUCCEEDED` 需所有 shard SUCCEEDED 且 `rowsOut + rowsDropped + rowsDeduped == rowsIn` | G-4（T10） | 等式按 WP-02 崩溃重放语义改为四元式，见 D-08（v2.1 修正） |
 | 5 `CANCELLED`：commands + chunk 边界落 checkpoint，支持后续 resume | T15/T16/T27 | **加 ack 超时兜底 T16**；`/resume` 语义改为新建 run（不复活终态），见 D-02 |
 
 ---
@@ -322,7 +322,7 @@ public class OrchestratorService {
 | `G-1 ALLOWED` | 迁移边在 `ALLOWED` 表内（违反即非法迁移，见 §6.4） | 全部 |
 | `G-2 PARTIAL` | 存在 `FAILED` shard 且其余 ∈ {`SUCCEEDED`,`SKIPPED`} | T11/T17/T18 |
 | `G-3 QUIESCE` | 该 run 无 `ASSIGNED`/`RUNNING` shard | T8/T12/T16/T21/T25 |
-| `G-4 BALANCE` | `rows_out + rows_dropped = rows_in` 且全 shard SUCCEEDED | T10/T19 |
+| `G-4 BALANCE` | `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in` 且全 shard SUCCEEDED | T10/T19 |
 | `G-5 ATTEMPTS` | `attempt_no < maxAttempts`（仅自动重试） | T8/T12/T17/T22 |
 | `G-6 VALIDATE` | V-1…V-4 校验链（§7.1） | T2/T3/T31 |
 | `G-7 DLT_CLEAN` | 无未 `resolved`/`abandoned` 的 DLT 行 | T25（`/resume`）/T10 |
@@ -530,18 +530,19 @@ SELECT status, COUNT(*) AS shards,
  GROUP BY status;
 ```
 
-**为什么等式是 `rows_out + rows_dropped = rows_in`，而 `rows_deduped` 被排除**（D-08，修正原方案 §3.2 规则 4）：
+**为什么等式是 `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in`**（D-08，v2.1 修正）：
 
 | 计数器 | 定义 | 写入时机 | 是否入等式 |
 |---|---|---|---|
-| `rows_in` | SourceReader 实际读出的行数 | 每 chunk 提交时累加 | 左端基准 |
+| `rows_in` | SourceReader 实际读出的行数（含崩溃后重放的重复读取） | 每 chunk 提交时累加 | 左端基准 |
 | `rows_out` | 目标库**新增/更新生效**的行数 | batchUpsert 返回的 affected 中扣除 DO NOTHING 命中 | ✅ |
-| `rows_dropped` | 因 FATAL 分类被丢弃并送 DLT 的行数 | 逐行判定失败时 | ✅ |
-| `rows_deduped` | `ON CONFLICT DO NOTHING` 命中（重放/续跑导致的重复） | 写入阶段 | ❌ |
+| `rows_filtered` | 业务规则过滤（transformer 返回 null） | 读转换阶段 | ✅ |
+| `rows_failed` | 写入/解析失败、已落 DLT 的行数 | 逐行判定失败时 | ✅ |
+| `rows_deduped` | `ON CONFLICT DO NOTHING` 命中（重放/续跑导致的重复） | 写入阶段 | ✅ |
 
-`rows_deduped` 的语义是「同一逻辑行被再次尝试写入」，它的对偶发生在 `rows_in` 侧：续跑时 `rows_in` 从 `last_cursor` 之后累计（INV-3 单调不减、不重复计数），所以 deduped 既不增加 `rows_in` 也不应冲减等式两边。若把它计入 `rows_dropped`，则第 2 次 attempt 起重试分片的等式必然不平——这是原方案规则 4 在跨 attempt 场景下的隐性缺陷。
+v2.0 曾把 `rows_deduped` 排除在等式外，前提是“续跑时 `rows_in` 从 `last_cursor` 之后累计、不重复计数”。该前提只在 checkpoint 已随 chunk 提交时成立；WP-02 的跨库/崩溃窗口是“目标已提交、checkpoint 未写”，重放会再次从旧游标读入同一批行，`rows_in` 随之增长而 `rows_out` 不增（全部幂等命中）。若 deduped 不入等式，这类**正确去重**的重放会被 G-4 误判为丢数并转 `NEEDS_ATTENTION`。因此 v2.1 改为四元等式；`rows_out` 仍是新增/生效行数，不把 deduped 混入其中，保留“写入层重复 vs 读数层新增”的可观测差异。
 
-**跨 attempt 的对账连续性**：自动重试（T12/T21）在同一 `run_id` 内进行，checkpoint PK 含 `run_id` 但行不被复制，`rows_in/out` 以 `GREATEST(旧值, 旧值+本次增量)` 累加，因此 G-4 在任意 attempt 后仍可判定。人工 `scope=full` 新建 run 时 checkpoint 全新（`rows_*` 从 0 起），等式自洽。
+**跨 attempt 的对账连续性**：自动重试（T12/T21）在同一 `run_id` 内进行，checkpoint PK 含 `run_id` 但行不被复制，`rows_in/out/filtered/failed/deduped` 以 `GREATEST(旧值, 旧值+本次增量)` 累加，因此 G-4 在任意 attempt 后仍可判定。人工 `scope=full` 新建 run 时 checkpoint 全新（`rows_*` 从 0 起），等式自洽。
 
 **run 行计数列的投影写入点**（已落地：`orchestrator/RunCounterProjector`）：`etl_task_run` 的 `shard_succeeded/failed/skipped` 与 `rows_in/out/dropped/deduped` 是上述聚合的**镜像**，不是自增计数。两个写入点各自必要：
 
@@ -680,7 +681,7 @@ QueuedStarvationCheck（并入 BackoffReleaseSweeper）
 | D-05 | `PARTIAL_SUCCESS` 补 →`SUCCEEDED`（T19 宽恕）与 →`CANCELLED`（T20） | §4 已提供 `/mark-succeeded-with-data-loss` 却无对应迁移，API 无处落地；非终态而无成功路径的 PARTIAL 是死态 | 不补（宽恕只能直改 DB，违反 P7） | GAP-4 |
 | D-06 | `SUPERSEDED` **仅存在于 run 层**，由「新建 run 归档旧终态 run」触发（T28/T29） | task 视图永远只指 current run，无歧义；触发者与时机不再是开放问题 | task 层也允许 `SUCCEEDED→SUPERSEDED`（无人能判断何时发生） | GAP-5 |
 | D-07 | `rowsDropped` 落为 checkpoint 持久列 `rows_dropped`，与 Phase 0 指标 `etl_records_dropped_total` 同口径 | 对账需要的数必须有人写；现有指标证明该语义已在 storage 侧产生（Poison Guard） | 只依指标不做持久列（重启即无法对账） | GAP-6 |
-| D-08 | 对账等式改为 `rows_out + rows_dropped = rows_in`，`rows_deduped` **不入等式** | 原式在跨 attempt 重跑时必不平（§7.5 推导）；dedup 是写入层重复而非读数层新增 | 保留原式并将 dedup 归入 dropped | GAP-6 |
+| D-08 | 对账等式为 `rows_out + rows_filtered + rows_failed + rows_deduped = rows_in` | WP-02 崩溃重放会再次读入同一批行（rows_in 增长）且全部幂等命中；deduped 不入等式会把正确去重误判为丢数 | v2.0 的 `rows_out + rows_dropped = rows_in` 并把 deduped 排除 | GAP-6 / 评审 P1-4 |
 | D-09 | 心跳与超时竞态由 CAS + `dispatched_at` 基线解决；回退前必做 quiesce | 至少一次投递下“双写”必然发生；CAS 是 P4 的自然结果 | 悲观锁（消费线程持锁 → rebalance） | GAP-7 |
 | D-10 | 令牌在 `QUEUED→DISPATCHED` **之前**获取；未派 shard 以 checkpoint `PENDING` 承载；`queued_reason` 区分排队成因 | 不新增状态即可表达“等令牌”；“派工即 DISPATCHED”与“背压排队”不再混用 | 新增 `THROTTLED`/`PARKED` 状态（状态集膨胀） | GAP-8 |
 | D-11 | shard 级重试用独立 `shard_attempt`，run 级用 `attempt_no`，两者解耦 | 否则一个瞬态分片失败会顶高任务级 attempt，误触 `NEEDS_ATTENTION` | 共用一个计数器 | — |
@@ -900,13 +901,13 @@ SELECT t.task_id, t.status AS task_status, r.status AS run_status
 -- 校验 2（INV-4）：SUCCEEDED 的 run 行数必平
 -- 注意：本查询比的是 etl_task_run.rows_*，依赖 §7.5 的计数投影；无投影时这些列恒为 0，
 -- 等式两边同 0 会“空转通过”（FullChainE2EIT 内置 rows_in > 0 的非空转守卫）
-SELECT ru.run_id, a.rows_in, a.rows_out, a.rows_dropped
+SELECT ru.run_id, a.rows_in, a.rows_out, a.rows_dropped, a.rows_deduped
   FROM etl_task_run ru
   JOIN (SELECT run_id, SUM(rows_in) rows_in, SUM(rows_out) rows_out,
-               SUM(rows_dropped) rows_dropped
+               SUM(rows_dropped) rows_dropped, SUM(rows_deduped) rows_deduped
           FROM etl_task_checkpoint GROUP BY run_id) a ON a.run_id = ru.run_id
  WHERE ru.status = 'SUCCEEDED'
-   AND ru.rows_out + ru.rows_dropped <> ru.rows_in;
+   AND ru.rows_out + ru.rows_dropped + ru.rows_deduped <> ru.rows_in;
 
 -- 校验 3（P2/INV-10）：终态 run 在 finished_at 之后不得再被“原地”更新
 -- 说明：T28/T29 归档后 run 的 status 已变为 SUPERSEDED，自然不在本查询的 IN 列表内，不会误报

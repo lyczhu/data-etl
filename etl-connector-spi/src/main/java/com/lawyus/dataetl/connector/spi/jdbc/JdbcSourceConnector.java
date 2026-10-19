@@ -85,7 +85,9 @@ public class JdbcSourceConnector implements SourceConnector {
             long min = rs.getLong(1);
             long max = rs.getLong(2);
             long count = rs.getLong(3);
-            List<long[]> ranges = ShardRanges.split(min, max, params.chunkSize(), params.maxShards());
+            // 方案 v2 D4：分片数 = 并行单元（desiredShards），chunk 只做分片内事务单元
+            List<long[]> ranges = ShardRanges.splitByParallelism(
+                    min, max, params.desiredShards(), params.maxShards());
             List<Shard> shards = new ArrayList<>(ranges.size());
             for (int i = 0; i < ranges.size(); i++) {
                 long[] r = ranges.get(i);
@@ -101,19 +103,36 @@ public class JdbcSourceConnector implements SourceConnector {
     public CloseableIterator<SourceRecord> open(Shard shard, SourceSpec spec) {
         TableSchema schema = readSchema(spec);
         String pk = schema.primaryKey();
-        String sql = "SELECT * FROM " + spec.table() + " WHERE " + pk + " >= ? AND " + pk + " <= ? ORDER BY " + pk;
+        // WP-02 断点续跑：resumeCursor 是“已提交的最后一行主键”，下次从 > cursor 开始（开区间）；
+        // 首跑用 pkFrom（闭区间）。两者都按 pk 升序，保证不漏不重。
+        Long resume = parseCursor(shard.resumeCursor());
+        String sql = resume != null
+                ? "SELECT * FROM " + spec.table() + " WHERE " + pk + " > ? AND " + pk + " <= ? ORDER BY " + pk
+                : "SELECT * FROM " + spec.table() + " WHERE " + pk + " >= ? AND " + pk + " <= ? ORDER BY " + pk;
         try {
-            // 流式游标：关 autoCommit + fetchSize（PG 要求）
+            // 流式游标：关 autoCommit + fetchSize（PG 要求）；MySQL 用 Integer.MIN_VALUE 逐行流式，避免全量缓冲 OOM
             Connection conn = open(spec);
             conn.setAutoCommit(false);
             java.sql.PreparedStatement ps = conn.prepareStatement(sql);
-            ps.setFetchSize(5000);
-            ps.setLong(1, shard.pkFrom());
+            ps.setFetchSize(type == ConnectorType.MYSQL ? Integer.MIN_VALUE : 5000);
+            ps.setLong(1, resume != null ? resume : shard.pkFrom());
             ps.setLong(2, shard.pkTo());
             ResultSet rs = ps.executeQuery();
             return new ResultSetCursor(shard.shardId(), pk, rs, ps, conn);
         } catch (SQLException e) {
             throw new RuntimeException("open shard cursor failed: " + shard.shardId(), e);
+        }
+    }
+
+    /** resumeCursor 解析：非数字（非 JDBC 源/空）返回 null，回落首跑语义。 */
+    static Long parseCursor(String resumeCursor) {
+        if (resumeCursor == null || resumeCursor.isBlank()) {
+            return null;
+        }
+        try {
+            return Long.parseLong(resumeCursor.trim());
+        } catch (NumberFormatException ignore) {
+            return null;
         }
     }
 

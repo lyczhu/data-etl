@@ -138,8 +138,12 @@ class EntryChainIT extends AbstractOrchestratorIT {
         for (String payload : payloads) {
             assertThat(payload).contains("\"runId\":\"" + runId + "\"")
                     .contains("\"pkFrom\"").contains("\"pkTo\"")
-                    .contains("\"sourceUrl\":\"" + ItInfra.SOURCE_URL + "\"")
-                    .contains("\"sourceTable\":\"" + ItInfra.SOURCE_TABLE + "\"");
+                    .contains("\"dataSourceId\":" + dataSourceId)
+                    .contains("\"sourceTable\":\"" + ItInfra.SOURCE_TABLE + "\"")
+                    .contains("\"targetTable\":");
+            // WP-06：派工消息不得携带明文连接/口令
+            assertThat(payload).doesNotContain("sourceUrl").doesNotContain("password")
+                    .doesNotContain("jdbc:");
             // §5.2：派工只带区间不带数据行 —— 一条命令远小于一个数据批
             assertThat(payload.length()).as("派工消息体积（字节）").isLessThan(2048);
         }
@@ -214,9 +218,12 @@ class EntryChainIT extends AbstractOrchestratorIT {
 
         List<String> matched = new ArrayList<>();
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
-            TopicPartition partition = new TopicPartition(ItInfra.TOPIC_DISPATCH, 0);
-            consumer.assign(List.of(partition));
-            consumer.seekToBeginning(List.of(partition));
+            // dispatch topic 是多分区（Gate1 #9），必须 assign 全部分区，不能只读 partition 0
+            List<TopicPartition> partitions = consumer.partitionsFor(ItInfra.TOPIC_DISPATCH).stream()
+                    .map(p -> new TopicPartition(ItInfra.TOPIC_DISPATCH, p.partition()))
+                    .toList();
+            consumer.assign(partitions);
+            consumer.seekToBeginning(partitions);
             long deadline = System.currentTimeMillis() + 30_000L;
             while (matched.size() < expected && System.currentTimeMillis() < deadline) {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1_000));

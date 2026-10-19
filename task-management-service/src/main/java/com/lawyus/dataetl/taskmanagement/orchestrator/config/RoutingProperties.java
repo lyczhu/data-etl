@@ -3,6 +3,9 @@ package com.lawyus.dataetl.taskmanagement.orchestrator.config;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * 新旧链路灰度路由开关（{@code orchestrator-design.md §11.2/§11.4}，方案 §7.1 回滚开关）。
  *
@@ -24,6 +27,8 @@ public class RoutingProperties {
     private boolean newWorker = false;
     /** 影子比对（新旧结果差异报表）开关，不影响链路行为。 */
     private boolean shadowCompare = false;
+    /** 灰度白名单（WP-16 / D12）：为空 = 全部 dataSource 走新链路；非空只放行列出的 dataSourceId。 */
+    private List<Long> dataSourceWhitelist = new ArrayList<>();
 
     public boolean isNewWorker() {
         return newWorker;
@@ -39,5 +44,22 @@ public class RoutingProperties {
 
     public void setShadowCompare(boolean shadowCompare) {
         this.shadowCompare = shadowCompare;
+    }
+
+    public List<Long> getDataSourceWhitelist() {
+        return dataSourceWhitelist;
+    }
+
+    public void setDataSourceWhitelist(List<Long> dataSourceWhitelist) {
+        this.dataSourceWhitelist = dataSourceWhitelist == null ? new ArrayList<>() : dataSourceWhitelist;
+    }
+
+    /** 该 dataSource 是否走新链路（总开关 + 白名单）。 */
+    public boolean isNewWorkerFor(Long dataSourceId) {
+        if (!newWorker) {
+            return false;
+        }
+        return dataSourceWhitelist.isEmpty()
+                || (dataSourceId != null && dataSourceWhitelist.contains(dataSourceId));
     }
 }

@@ -2,6 +2,7 @@ package com.lawyus.dataetl.taskmanagement.orchestrator;
 
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
 import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskCheckpointRepository;
+import com.lawyus.dataetl.taskmanagement.orchestrator.repository.EtlTaskDltRepository;
 import org.springframework.stereotype.Component;
 
 import java.util.Set;
@@ -16,12 +17,17 @@ import static com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus.RUNNI
 import static com.lawyus.dataetl.taskmanagement.orchestrator.EtlTaskStatus.SUCCEEDED;
 
 /**
- * 守护链：先做 G-1（迁移表合法性），再对适用边求值 G-2..G-5（{@code orchestrator-design.md §6.1 guard 表}）。
+ * 守护链：先做 G-1（迁移表合法性），再对适用边求值 G-2..G-5 与 G-7（{@code orchestrator-design.md §6.1}）。
  *
- * <p>G-6（VALIDATE 校验链）与 G-7（DLT_CLEAN）依赖尚未在本切片落地的校验/DLT 基础设施
- * （分别在 dispatch/validate 流程与 Phase 2 的 DLT 表），此处预留 hook 并注明；其余 guard 已实现。
+ * <p>v2（WP-10）补齐：
+ * <ul>
+ *   <li>G-2 总和校验：{@code succeeded+failed+skipped == shard_total}；</li>
+ *   <li>T19 {@code PARTIAL_SUCCESS→SUCCEEDED} 要求 {@code failed==0} 且无未解决 DLT；</li>
+ *   <li>G-7 DLT_CLEAN：任何进入 {@code SUCCEEDED} 的边都要求未解决 DLT 为 0；</li>
+ *   <li>G-4 还要求 {@code rows_failed==0}（坏行不得判成功）。</li>
+ * </ul>
  *
- * <p>命名与 §10.1 指标标签 {@code etl.guard.failure.total{guard}} 对齐。
+ * <p>G-6（VALIDATE 校验链）由 {@code RunValidator} 在入口链完成，不在迁移边求值。
  */
 @Component
 public class GuardChain {
@@ -48,10 +54,19 @@ public class GuardChain {
             new AllowedTransitions.Edge(PARTIAL_SUCCESS, SUCCEEDED) // T19
     );
 
-    private final EtlTaskCheckpointRepository checkpointRepository;
+    // 进入 SUCCEEDED 的边：G-7 DLT_CLEAN
+    private static final Set<AllowedTransitions.Edge> SUCCESS_EDGES = Set.of(
+            new AllowedTransitions.Edge(RUNNING, SUCCEEDED),        // T10
+            new AllowedTransitions.Edge(PARTIAL_SUCCESS, SUCCEEDED) // T19
+    );
 
-    public GuardChain(EtlTaskCheckpointRepository checkpointRepository) {
+    private final EtlTaskCheckpointRepository checkpointRepository;
+    private final EtlTaskDltRepository dltRepository;
+
+    public GuardChain(EtlTaskCheckpointRepository checkpointRepository,
+                      EtlTaskDltRepository dltRepository) {
         this.checkpointRepository = checkpointRepository;
+        this.dltRepository = dltRepository;
     }
 
     /** G-1：迁移边必须在表内，否则协议被破坏（抛 {@link IllegalStateTransitionException}）。 */
@@ -62,7 +77,7 @@ public class GuardChain {
     }
 
     /**
-     * 对该边适用的 G-2..G-5 求值。G-6/G-7 见类注释（本切片未接入校验链与 DLT 基础设施）。
+     * 对该边适用的 G-2..G-5 / G-7 求值。
      *
      * @param run 迁移前的 run 快照（含当前 status / attempt_no）
      */
@@ -82,29 +97,54 @@ public class GuardChain {
 
         if (BALANCE_EDGES.contains(edge)) {
             RunAggregate a = checkpointRepository.aggregate(run.getRunId());
-            long succeeded = a.getSucceeded() == null ? 0L : a.getSucceeded();
-            long failed = a.getFailed() == null ? 0L : a.getFailed();
-            long skipped = a.getSkipped() == null ? 0L : a.getSkipped();
+            long succeeded = nz(a.getSucceeded());
+            long failed = nz(a.getFailed());
+            long skipped = nz(a.getSkipped());
             long shardTotal = run.getShardTotal() == null ? 0L : run.getShardTotal().longValue();
             if (from == RUNNING && (succeeded != shardTotal || failed != 0L || skipped != 0L)) {
                 throw new GuardFailureException("G-4_BALANCE", "并非所有分片 SUCCEEDED");
             }
+            if (from == PARTIAL_SUCCESS && failed != 0L) {
+                throw new GuardFailureException("G-4_BALANCE", "仍有 FAILED 分片，不能 T19 改判 SUCCEEDED");
+            }
             if (!a.isBalanced()) {
                 throw new GuardFailureException("G-4_BALANCE",
-                        "rows_out + rows_dropped != rows_in (out=" + a.getRowsOut()
-                                + ", dropped=" + a.getRowsDropped() + ", in=" + a.getRowsIn() + ")");
+                        "rows_out + rows_filtered + rows_failed + rows_deduped != rows_in (out=" + a.getRowsOut()
+                                + ", filtered=" + a.getRowsFiltered() + ", failed=" + a.getRowsFailed()
+                                + ", deduped=" + a.getRowsDeduped() + ", in=" + a.getRowsIn() + ")");
             }
+            if (!a.hasNoFailedRows()) {
+                throw new GuardFailureException("G-4_BALANCE",
+                        "rows_failed=" + a.getRowsFailed() + " > 0，不得 SUCCEEDED");
+            }
+        }
+
+        if (SUCCESS_EDGES.contains(edge) && dltRepository.countUnresolved(run.getRunId()) > 0) {
+            throw new GuardFailureException("G-7_DLT_CLEAN",
+                    "run " + run.getRunId() + " 仍有未解决 DLT 行");
         }
 
         if (from == RUNNING && to == PARTIAL_SUCCESS) {
             RunAggregate a = checkpointRepository.aggregate(run.getRunId());
-            if (a.getFailed() < 1) {
+            long succeeded = nz(a.getSucceeded());
+            long failed = nz(a.getFailed());
+            long skipped = nz(a.getSkipped());
+            long shardTotal = run.getShardTotal() == null ? 0L : run.getShardTotal().longValue();
+            if (failed < 1) {
                 throw new GuardFailureException("G-2_PARTIAL", "无 FAILED 分片，不满足 PARTIAL_SUCCESS 前置");
+            }
+            if (succeeded + failed + skipped != shardTotal) {
+                throw new GuardFailureException("G-2_PARTIAL",
+                        "分片计数不等于计划数: " + succeeded + "+" + failed + "+" + skipped + " != " + shardTotal);
             }
         }
     }
 
     private boolean isQuiesced(String runId) {
         return checkpointRepository.countActiveShards(runId) == 0;
+    }
+
+    private static long nz(Long v) {
+        return v == null ? 0L : v;
     }
 }

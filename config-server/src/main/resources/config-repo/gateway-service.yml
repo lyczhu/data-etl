@@ -86,7 +86,8 @@ logging:
 # 新增：网关统一 JWT 鉴权（修复“鉴权闭环缺失”）
 # secret 必须与 user-service 签发 token 的密钥一致
 jwt:
-  secret: dataetl-secret-key-for-jwt-token-generation-and-validation-must-be-at-least-256-bits
+  # WP-06：生产必须通过环境变量 JWT_SECRET 注入；仓库不再硬编码生产密钥
+  secret: ${JWT_SECRET:dataetl-dev-only-jwt-secret-change-in-production-0123456789}
 
 gateway:
   security:

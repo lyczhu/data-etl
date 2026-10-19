@@ -2,29 +2,53 @@ package com.lawyus.dataetl.worker.pipeline;
 
 import com.lawyus.dataetl.connector.spi.CloseableIterator;
 import com.lawyus.dataetl.connector.spi.ConnectorRegistry;
+import com.lawyus.dataetl.connector.spi.ConnectorType;
 import com.lawyus.dataetl.connector.spi.SinkWriter;
 import com.lawyus.dataetl.connector.spi.SourceConnector;
+import com.lawyus.dataetl.connector.spi.jdbc.JdbcSinkWriter;
+import com.lawyus.dataetl.connector.spi.model.ColumnDef;
+import com.lawyus.dataetl.connector.spi.model.FailedRow;
+import com.lawyus.dataetl.connector.spi.model.Shard;
 import com.lawyus.dataetl.connector.spi.model.SinkResult;
 import com.lawyus.dataetl.connector.spi.model.SourceRecord;
+import com.lawyus.dataetl.connector.spi.model.SourceSpec;
 import com.lawyus.dataetl.connector.spi.model.TableSchema;
+import com.lawyus.dataetl.worker.checkpoint.CheckpointReader;
 import com.lawyus.dataetl.worker.checkpoint.CheckpointWriter;
+import com.lawyus.dataetl.worker.checkpoint.DltWriter;
+import com.lawyus.dataetl.worker.checkpoint.ShardCheckpointState;
 import com.lawyus.dataetl.worker.config.WorkerProperties;
+import com.lawyus.dataetl.worker.datasource.DataSourceResolver;
+import com.lawyus.dataetl.worker.datasource.ResolvedDataSource;
 import com.lawyus.dataetl.worker.model.ShardDispatch;
+import com.lawyus.dataetl.worker.model.ShardDltMessage;
 import com.lawyus.dataetl.worker.model.ShardProgress;
 import com.lawyus.dataetl.worker.model.ShardResultMessage;
 import com.lawyus.dataetl.worker.report.WorkerEventReporter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionTemplate;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 进程内 E→T→L 单分片执行器（方案 §2.1 / §5.2）：读源游标 → 按 chunk 转换 → 批写目标 → 提交 checkpoint →
- * 分片结束发 results。<b>不引 Kafka 到数据面</b>，只在控制面回报。
+ * 进程内 E→T→L 单分片执行器（方案 v2 WP-02/03/04/05/06）。
  *
- * <p>checkpoint 由本执行器直写（{@code worker} 是唯一写者，§4.1）；results 只是触发器，终局由 orchestrator 聚合重算（§7.5）。
+ * <p>关键语义：
+ * <ul>
+ *   <li><b>续跑</b>：从 checkpoint 的 {@code last_cursor} 之后读；每个 chunk 提交后写游标；</li>
+ *   <li><b>原子性</b>：同库时目标写入 + checkpoint + DLT 共享一个本地事务；跨库用幂等键 + checkpoint after commit；</li>
+ *   <li><b>幂等</b>：每行带 {@code idempotency_key}，重放命中 {@code ON CONFLICT DO NOTHING}；</li>
+ *   <li><b>丢数可见</b>：业务过滤计 {@code rows_filtered}，写入失败计 {@code rows_failed} 并落 DLT；</li>
+ *   <li><b>失败处置</b>：{@link ErrorClassifier} 分类，TRANSIENT 退避重试，FATAL/PERSISTENT 耗尽后落 FAILED + DLT。</li>
+ * </ul>
  */
 @Component
 public class ShardExecutor {
@@ -38,97 +62,278 @@ public class ShardExecutor {
 
     private final ConnectorRegistry registry;
     private final CheckpointWriter checkpointWriter;
+    private final CheckpointReader checkpointReader;
+    private final DltWriter dltWriter;
     private final WorkerEventReporter reporter;
     private final WorkerProperties properties;
     private final RecordTransformer transformer;
+    private final DataSource dataSource;
+    private final TransactionTemplate transactionTemplate;
+    private final DataSourceResolver dataSourceResolver;
 
     public ShardExecutor(ConnectorRegistry registry,
                          CheckpointWriter checkpointWriter,
+                         CheckpointReader checkpointReader,
+                         DltWriter dltWriter,
                          WorkerEventReporter reporter,
                          WorkerProperties properties,
-                         RecordTransformer transformer) {
+                         RecordTransformer transformer,
+                         DataSource dataSource,
+                         TransactionTemplate transactionTemplate,
+                         DataSourceResolver dataSourceResolver) {
         this.registry = registry;
         this.checkpointWriter = checkpointWriter;
+        this.checkpointReader = checkpointReader;
+        this.dltWriter = dltWriter;
         this.reporter = reporter;
         this.properties = properties;
         this.transformer = transformer;
+        this.dataSource = dataSource;
+        this.transactionTemplate = transactionTemplate;
+        this.dataSourceResolver = dataSourceResolver;
     }
 
     public SinkResult execute(ShardDispatch d) {
-        SourceConnector source = registry.sourceFor(d.connectorTypeEnum());
-        SinkWriter sink = registry.sinkFor(d.connectorTypeEnum());
-        TableSchema srcSchema = source.readSchema(d.sourceSpec());
-        TableSchema tgtSchema = new TableSchema(d.getTargetTable(), srcSchema.columns());
-        sink.ensureTargetTable(tgtSchema, d.targetSpec());
+        ConnectorType type = d.connectorTypeEnum();
+        SourceConnector source = registry.sourceFor(type);
+        ResolvedDataSource sourceDs = dataSourceResolver.resolve(d.getDataSourceId());
+        SourceSpec sourceSpec = sourceDs.toSourceSpec(type, d.getSourceTable());
+        SinkWriter sink = sinkFor(d, type);
 
-        long rowsIn = 0;
-        SinkResult total = SinkResult.zero();
+        TableSchema srcSchema = source.readSchema(sourceSpec);
+        TableSchema tgtSchema = targetSchema(d, srcSchema);
+        sink.ensureTargetTable(tgtSchema, new SourceSpec(type, null, null, null, null, d.getTargetTable()));
+
+        int attempt = Math.max(1, d.getAttemptNo());
+        int retries = 0;
+        while (true) {
+            ShardCheckpointState state = checkpointReader.load(d.getTaskId(), d.getRunId(), d.getShardId());
+            Counters c = new Counters(state);
+            String resume = state.hasCursor() ? state.lastCursor() : d.getResumeCursor();
+            try {
+                runOnce(d, source, sink, sourceSpec, tgtSchema, resume, attempt, c);
+                if (c.rowsFailed > 0) {
+                    // 好行已提交，坏行已落 DLT；分片判 FAILED，run 侧由 DLT 监听转 NEEDS_ATTENTION
+                    finish(d, SHARD_FAILED, attempt, c, "FATAL", "rows_failed=" + c.rowsFailed);
+                    reporter.reportDlt(new ShardDltMessage(d.getTaskId(), d.getRunId(), d.getShardId(),
+                            "FATAL", "rows_failed=" + c.rowsFailed, c.rowsFailed));
+                    reportResult(d, SHARD_FAILED, c, "FATAL", "rows_failed=" + c.rowsFailed);
+                    return c.toSinkResult();
+                }
+                String finalCursor = d.getPkTo() == null ? c.lastCursor : String.valueOf(d.getPkTo());
+                finish(d, SHARD_SUCCEEDED, attempt, c, null, null, finalCursor);
+                reportResult(d, SHARD_SUCCEEDED, c, null, null);
+                log.info("shard {} succeeded run={} rowsIn={} rowsOut={} deduped={}",
+                        d.getShardId(), d.getRunId(), c.rowsIn, c.rowsOut, c.rowsDeduped);
+                return c.toSinkResult();
+            } catch (RuntimeException e) {
+                ErrorClassifier.Kind kind = ErrorClassifier.classify(e);
+                boolean retryable = kind == ErrorClassifier.Kind.TRANSIENT
+                        && retries < Math.max(0, properties.getShardMaxRetries());
+                if (retryable) {
+                    retries++;
+                    long backoff = Math.max(1, properties.getRetryBackoffMs()) * retries;
+                    log.warn("shard {} transient failure run={} attempt={} retry {}/{} in {}ms: {}",
+                            d.getShardId(), d.getRunId(), attempt, retries,
+                            properties.getShardMaxRetries(), backoff, e.getMessage());
+                    sleep(backoff);
+                    continue;   // 重新读 checkpoint：从最后已提交 chunk 之后续跑
+                }
+                log.error("shard {} failed run={} class={}: {}", d.getShardId(), d.getRunId(),
+                        kind, e.getMessage(), e);
+                finish(d, SHARD_FAILED, attempt, c, kind.name(), abbreviate(e.toString()));
+                try {
+                    dltWriter.insertShardFailure(d.getTaskId(), d.getRunId(), d.getShardId(),
+                            kind.name(), abbreviate(e.toString()));
+                } catch (RuntimeException dltFailure) {
+                    log.error("write shard DLT row failed run={} shard={}: {}",
+                            d.getRunId(), d.getShardId(), dltFailure.getMessage());
+                }
+                reporter.reportDlt(new ShardDltMessage(d.getTaskId(), d.getRunId(), d.getShardId(),
+                        kind.name(), abbreviate(e.getMessage()), 0));
+                reportResult(d, SHARD_FAILED, c, kind.name(), abbreviate(e.toString()));
+                return c.toSinkResult();
+            }
+        }
+    }
+
+    /** 读完整个分片；失败时抛出，由外层决定重试/落 DLT。 */
+    private void runOnce(ShardDispatch d, SourceConnector source, SinkWriter sink,
+                         SourceSpec sourceSpec, TableSchema tgtSchema, String resumeCursor,
+                         int attempt, Counters c) {
+        Shard shard = d.toShard(resumeCursor);
         int chunkSize = Math.max(1, properties.getChunkSize());
-
-        try (CloseableIterator<SourceRecord> it = source.open(d.toShard(), d.sourceSpec())) {
+        long lastProgressAt = 0;
+        try (CloseableIterator<SourceRecord> it = source.open(shard, sourceSpec)) {
             List<SourceRecord> chunk = new ArrayList<>(chunkSize);
             while (it.hasNext()) {
                 SourceRecord rec = it.next();
-                rowsIn++;
+                c.rowsIn++;
                 SourceRecord transformed = transformer.apply(rec);
                 if (transformed == null) {
-                    total = total.combine(new SinkResult(0, 1, 0));   // 被丢弃的行
-                } else {
-                    chunk.add(transformed);
+                    c.rowsFiltered++;   // 业务规则过滤，可进成功等式
+                    continue;
                 }
+                String key = IdempotencyKeys.of(d.getTaskId(), d.getSourceTable(), transformed.pk());
+                chunk.add(IdempotencyKeys.withKey(transformed, key));
                 if (chunk.size() >= chunkSize) {
-                    total = commitChunk(d, tgtSchema, sink, chunk, rowsIn, total);
+                    SinkResult r = commitChunk(d, sink, tgtSchema, chunk, attempt, c);
                     chunk.clear();
+                    if (r.rowsFailed() > 0) {
+                        c.lastCursor = resumeBeforeFailure(r, c.lastCursor);
+                        return;
+                    }
+                    lastProgressAt = maybeReportProgress(d, c, lastProgressAt);
                 }
             }
             if (!chunk.isEmpty()) {
-                total = commitChunk(d, tgtSchema, sink, chunk, rowsIn, total);
-                chunk.clear();
+                SinkResult r = commitChunk(d, sink, tgtSchema, chunk, attempt, c);
+                if (r.rowsFailed() > 0) {
+                    c.lastCursor = resumeBeforeFailure(r, c.lastCursor);
+                    return;
+                }
+                maybeReportProgress(d, c, lastProgressAt);
             }
-        } catch (RuntimeException e) {
-            log.error("shard {} failed for run {}: {}", d.getShardId(), d.getRunId(), e.getMessage(), e);
-            checkpointWriter.upsert(d.getTaskId(), d.getRunId(), d.getShardId(), SHARD_FAILED,
-                    null, rowsIn, total.rowsOut(), total.rowsDropped(), total.rowsDeduped(),
-                    "PERSISTENT", abbreviate(e.toString()));
-            reportResult(d, SHARD_FAILED, rowsIn, total, "PERSISTENT", abbreviate(e.toString()));
-            return total;
         }
-
-        // 全部分片游标越界且提交成功 → SUCCEEDED；last_cursor 记本 shard 上界
-        checkpointWriter.upsert(d.getTaskId(), d.getRunId(), d.getShardId(), SHARD_SUCCEEDED,
-                d.getPkTo() == null ? null : String.valueOf(d.getPkTo()),
-                rowsIn, total.rowsOut(), total.rowsDropped(), total.rowsDeduped(), null, null);
-        reportResult(d, SHARD_SUCCEEDED, rowsIn, total, null, null);
-        log.info("shard {} succeeded run={} rowsIn={} {}", d.getShardId(), d.getRunId(), rowsIn, total);
-        return total;
     }
 
-    private SinkResult commitChunk(ShardDispatch d, TableSchema tgtSchema, SinkWriter sink,
-                                   List<SourceRecord> chunk, long rowsIn, SinkResult running) {
-        SinkResult batchResult = sink.writeBatch(tgtSchema, chunk);
-        SinkResult combined = running.combine(batchResult);
-        // 数据 + 断点：每个 chunk 提交即 checkpoint（与目标写同侧，§4.1）
-        checkpointWriter.upsert(d.getTaskId(), d.getRunId(), d.getShardId(), SHARD_RUNNING,
-                null, rowsIn, combined.rowsOut(), combined.rowsDropped(), combined.rowsDeduped(), null, null);
-        reporter.reportProgress(new ShardProgress(d.getTaskId(), d.getRunId(), d.getShardId(),
-                rowsIn, combined.rowsOut(), System.currentTimeMillis()));
-        return combined;
+    /**
+     * 提交一个 chunk：同库时目标 + checkpoint + DLT 同事务；跨库时目标先幂等提交，
+     * checkpoint 后写（重放安全）。计数只在事务提交成功后累加。
+     */
+    private SinkResult commitChunk(ShardDispatch d, SinkWriter sink, TableSchema tgtSchema,
+                                   List<SourceRecord> chunk, int attempt, Counters c) {
+        String lastPk = String.valueOf(chunk.get(chunk.size() - 1).pk());
+        long rowsInSnapshot = c.rowsIn;
+        long outSnapshot = c.rowsOut;
+        long filteredSnapshot = c.rowsFiltered;
+        long failedSnapshot = c.rowsFailed;
+        long dedupedSnapshot = c.rowsDeduped;
+
+        boolean sharedTx = sink.supportsExternalTransaction()
+                && properties.isSameDatabaseTransaction()
+                && d.getTargetDataSourceId() == null;   // 目标为 worker 本地库才可共享事务
+        SinkResult result;
+        if (sharedTx) {
+            result = transactionTemplate.execute(status -> {
+                try {
+                    Connection conn = DataSourceUtils.getConnection(dataSource);
+                    SinkResult sr = sink.writeBatch(conn, tgtSchema, chunk);
+                    checkpointWriter.upsert(conn, d.getTaskId(), d.getRunId(), d.getShardId(), SHARD_RUNNING,
+                            lastPk, lastPk, attempt,
+                            rowsInSnapshot,
+                            outSnapshot + sr.rowsOut(),
+                            filteredSnapshot + sr.rowsFiltered(),
+                            failedSnapshot + sr.rowsFailed(),
+                            filteredSnapshot + sr.rowsFiltered() + failedSnapshot + sr.rowsFailed(),
+                            dedupedSnapshot + sr.rowsDeduped(),
+                            null, null);
+                    dltWriter.insertAll(conn, d.getTaskId(), d.getRunId(), d.getShardId(), sr.failures());
+                    return sr;
+                } catch (SQLException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } else {
+            result = sink.writeBatch(tgtSchema, chunk);
+            checkpointWriter.upsert(d.getTaskId(), d.getRunId(), d.getShardId(), SHARD_RUNNING,
+                    lastPk, lastPk, attempt,
+                    rowsInSnapshot,
+                    outSnapshot + result.rowsOut(),
+                    filteredSnapshot + result.rowsFiltered(),
+                    failedSnapshot + result.rowsFailed(),
+                    filteredSnapshot + result.rowsFiltered() + failedSnapshot + result.rowsFailed(),
+                    dedupedSnapshot + result.rowsDeduped(),
+                    null, null);
+            dltWriter.insertAll(d.getTaskId(), d.getRunId(), d.getShardId(), result.failures());
+        }
+        c.rowsOut += result.rowsOut();
+        c.rowsFiltered += result.rowsFiltered();
+        c.rowsFailed += result.rowsFailed();
+        c.rowsDeduped += result.rowsDeduped();
+        c.failures.addAll(result.failures());
+        c.lastPk = lastPk;
+        c.lastCursor = lastPk;
+        return result;
     }
 
-    private void reportResult(ShardDispatch d, String status, long rowsIn, SinkResult total,
+    /** 坏行之前续跑：cursor = min(失败行主键) - 1；好行已写且幂等，重放不会重复。 */
+    private static String resumeBeforeFailure(SinkResult result, String currentCursor) {
+        long minFailed = Long.MAX_VALUE;
+        for (FailedRow f : result.failures()) {
+            try {
+                minFailed = Math.min(minFailed, Long.parseLong(f.sourceKey()));
+            } catch (RuntimeException ignore) {
+                // 非数字主键：保持当前游标（无法精确回退）
+            }
+        }
+        return minFailed == Long.MAX_VALUE ? currentCursor : String.valueOf(minFailed - 1);
+    }
+
+    private void finish(ShardDispatch d, String status, int attempt, Counters c,
+                        String errorClass, String errorDetail) {
+        finish(d, status, attempt, c, errorClass, errorDetail, c.lastCursor);
+    }
+
+    private void finish(ShardDispatch d, String status, int attempt, Counters c,
+                        String errorClass, String errorDetail, String cursor) {
+        checkpointWriter.upsert(d.getTaskId(), d.getRunId(), d.getShardId(), status,
+                cursor, c.lastPk, attempt,
+                c.rowsIn, c.rowsOut, c.rowsFiltered, c.rowsFailed, c.rowsDropped(), c.rowsDeduped,
+                errorClass, errorDetail);
+    }
+
+    private long maybeReportProgress(ShardDispatch d, Counters c, long lastProgressAt) {
+        long now = System.currentTimeMillis();
+        long interval = Math.max(0, properties.getProgressIntervalMs());
+        if (interval == 0 || now - lastProgressAt >= interval) {
+            reporter.reportProgress(new ShardProgress(d.getTaskId(), d.getRunId(), d.getShardId(),
+                    c.rowsIn, c.rowsOut, now));
+            return now;
+        }
+        return lastProgressAt;
+    }
+
+    private SinkWriter sinkFor(ShardDispatch d, ConnectorType type) {
+        if (d.getTargetDataSourceId() != null) {
+            ResolvedDataSource target = dataSourceResolver.resolve(d.getTargetDataSourceId());
+            return new JdbcSinkWriter(type, target::openConnection);
+        }
+        return registry.sinkFor(type);
+    }
+
+    private static TableSchema targetSchema(ShardDispatch d, TableSchema srcSchema) {
+        List<ColumnDef> cols = new ArrayList<>(srcSchema.columns());
+        boolean hasKey = cols.stream().anyMatch(c -> IdempotencyKeys.COLUMN.equalsIgnoreCase(c.name()));
+        if (!hasKey) {
+            cols.add(new ColumnDef(IdempotencyKeys.COLUMN, "varchar", Types.VARCHAR, 64, false));
+        }
+        return new TableSchema(d.getTargetTable(), cols);
+    }
+
+    private void reportResult(ShardDispatch d, String status, Counters c,
                               String errorClass, String errorDetail) {
         ShardResultMessage m = new ShardResultMessage();
         m.setTaskId(d.getTaskId());
         m.setRunId(d.getRunId());
         m.setShardId(d.getShardId());
         m.setStatus(status);
-        m.setRowsIn(rowsIn);
-        m.setRowsOut(total.rowsOut());
-        m.setRowsDropped(total.rowsDropped());
-        m.setRowsDeduped(total.rowsDeduped());
+        m.setRowsIn(c.rowsIn);
+        m.setRowsOut(c.rowsOut);
+        m.setRowsDropped(c.rowsDropped());
+        m.setRowsDeduped(c.rowsDeduped);
         m.setErrorClass(errorClass);
         m.setErrorDetail(errorDetail);
         reporter.reportResult(m);
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("shard retry interrupted", e);
+        }
     }
 
     private static String abbreviate(String s) {
@@ -136,5 +341,35 @@ public class ShardExecutor {
             return null;
         }
         return s.length() <= 2000 ? s : s.substring(0, 2000);
+    }
+
+    /** 跨 attempt 累计计数；旧库 rows_dropped 无 filtered/failed 明细时按过滤口径回填。 */
+    private static final class Counters {
+        private long rowsIn;
+        private long rowsOut;
+        private long rowsFiltered;
+        private long rowsFailed;
+        private long rowsDeduped;
+        private String lastCursor;
+        private String lastPk;
+        private final List<FailedRow> failures = new ArrayList<>();
+
+        private Counters(ShardCheckpointState s) {
+            this.rowsIn = s.rowsIn();
+            this.rowsOut = s.rowsOut();
+            this.rowsFailed = s.rowsFailed();
+            this.rowsFiltered = Math.max(s.rowsFiltered(), s.rowsDropped() - s.rowsFailed());
+            this.rowsDeduped = s.rowsDeduped();
+            this.lastCursor = s.lastCursor();
+            this.lastPk = s.lastPk();
+        }
+
+        private long rowsDropped() {
+            return rowsFiltered + rowsFailed;
+        }
+
+        private SinkResult toSinkResult() {
+            return new SinkResult(rowsOut, rowsFiltered, rowsFailed, rowsDeduped, failures);
+        }
     }
 }

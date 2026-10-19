@@ -17,15 +17,15 @@ import java.util.Locale;
  * （{@code orchestrator-design.md §7.2}）。
  *
  * <ul>
- *   <li>源/目标定位：由 {@link EtlTaskRepository} 取 {@link EtlTask}（源表/目标表/dataSourceId），
- *       再经 {@link DataSourceServiceClient} 解析连接串与凭证；</li>
+ *   <li>源/目标定位：由 {@link EtlTaskRepository} 取 {@link EtlTask}（源表/目标表/dataSourceId/targetDataSourceId），
+ *       只解析数据源<b>类型</b>用于选 connector，不把连接串/凭证放进消息（WP-06/D10）；</li>
  *   <li>connector 类型：按 {@link DataSource#getType()} 宽松映射为 {@code MYSQL}/{@code POSTGRES}
  *       （Phase 1 仅 JDBC 实装，其余源接入后扩展此映射）；</li>
  *   <li>主键区间：委托 {@link ShardRangeResolver}（默认空区间，worker 依 {@code resumeCursor} 续跑）。</li>
  * </ul>
  *
- * <p>解析失败（数据源不可达/任务不存在）抛异常，由 {@code DispatchService.pump} 捕获并把该 run 保持
- * {@code QUEUED}（不推进 T5），等 sweeper/下轮重试——派工是尽力而为，失败不污染状态机。
+ * <p>解析失败（数据源不可达/任务不存在）抛异常，由 {@code DispatchService.pump} 捕获并把该 run 保留
+ * 可派状态，等 sweeper/下轮重试——派工是尽力而为，失败不污染状态机。
  */
 @Component
 public class ShardDispatchAssembler {
@@ -69,12 +69,10 @@ public class ShardDispatchAssembler {
             cmd.setPkTo(bounds.to());
         }
 
+        cmd.setTargetDataSourceId(task.getTargetDataSourceId());
         if (ds != null) {
+            // WP-06：只取类型，不复制 url/username/password/driver
             cmd.setConnectorType(mapConnector(ds.getType()));
-            cmd.setSourceUrl(ds.getUrl());
-            cmd.setSourceUsername(ds.getUsername());
-            cmd.setSourcePassword(ds.getPassword());
-            cmd.setSourceDriver(ds.getDriverClassName());
         } else {
             log.warn("dispatch assemble: data source unresolved for task={} (connector defaults POSTGRES)",
                     task.getTaskId());

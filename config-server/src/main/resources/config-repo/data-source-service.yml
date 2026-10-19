@@ -24,6 +24,11 @@ eureka:
   instance:
     prefer-ip-address: true
 
+etl:
+  security:
+    # WP-06：数据源口令 AES/GCM 密钥；生产必须通过环境变量 ETL_SECRET_KEY 注入，禁止使用仓库默认值
+    secret-key: ${ETL_SECRET_KEY:}
+
 management:
   endpoints:
     web:
