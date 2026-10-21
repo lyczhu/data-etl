@@ -63,3 +63,17 @@ Counter.builder("etl.inbound.count")
 把这些示例复制到以下服务的 `src/main/java/.../metrics` 包中，并注入 `MeterRegistry` 或直接在构造函数中创建指标。示例实现已添加到 `data-extraction-service`:
 
 - `data-extraction-service/src/main/java/com/lawyus/dataetl/dataextraction/metrics/ExampleMetricService.java`
+
+7) Phase 2 治理面指标（已实现，Prometheus 名称为下划线形式）
+
+| Micrometer 名称 | 类型 | 来源 | 含义 |
+|---|---|---|---|
+| `etl.audit.write.failures` | counter | `AuditWriter` | 审计写失败次数（迁移已回滚） |
+| `etl.audit.cleanup.deleted` | counter | `AuditRetentionSweeper` | 保留期清理行数 |
+| `etl.outbox.pending` | gauge | `OutboxPoller` | 待投递行数 |
+| `etl.outbox.oldest.pending.age.seconds` | gauge | `OutboxPoller` | 最老待投递行年龄 |
+| `etl.outbox.sent` | counter | `OutboxPoller` | 成功投递行数 |
+| `etl.outbox.send.failures` | counter | `OutboxPoller` | 投递失败次数 |
+| `etl.outbox.cleaned` | counter | `OutboxPoller` | 已发送行清理数 |
+| `etl.reconciliation.evaluations` | counter(tag `result`) | `ReconciliationService` | 对账结果 PASS/MISMATCH/ERROR |
+| `etl.target.table.count` | gauge(tag `state`) | `TargetTableRegistry` | 目标表登记数 |

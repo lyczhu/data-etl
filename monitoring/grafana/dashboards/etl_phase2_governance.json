@@ -1,0 +1,71 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "title": "ETL Phase 2 Governance",
+  "tags": ["etl", "phase2", "audit", "outbox", "reconciliation", "target-table"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-24h", "to": "now"},
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Audit write failures / 5m",
+      "gridPos": {"x": 0, "y": 0, "w": 8, "h": 7},
+      "targets": [
+        {"expr": "sum(rate(etl_audit_write_failures_total[5m]))", "legendFormat": "failures/s"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Audit retention deleted / 1h",
+      "gridPos": {"x": 8, "y": 0, "w": 8, "h": 7},
+      "targets": [
+        {"expr": "sum(increase(etl_audit_cleanup_deleted_total[1h]))", "legendFormat": "deleted"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Outbox pending / oldest age (s)",
+      "gridPos": {"x": 16, "y": 0, "w": 8, "h": 7},
+      "targets": [
+        {"expr": "max(etl_outbox_pending)", "legendFormat": "pending"},
+        {"expr": "max(etl_outbox_oldest_pending_age_seconds)", "legendFormat": "oldest age"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox sent vs failures / 5m",
+      "gridPos": {"x": 0, "y": 7, "w": 12, "h": 7},
+      "targets": [
+        {"expr": "sum(rate(etl_outbox_sent_total[5m]))", "legendFormat": "sent/s"},
+        {"expr": "sum(rate(etl_outbox_send_failures_total[5m]))", "legendFormat": "failures/s"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox cleaned sent rows / 1d",
+      "gridPos": {"x": 12, "y": 7, "w": 12, "h": 7},
+      "targets": [
+        {"expr": "sum(increase(etl_outbox_cleaned_total[1d]))", "legendFormat": "cleaned"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reconciliation evaluations / 1d by result",
+      "gridPos": {"x": 0, "y": 14, "w": 12, "h": 7},
+      "targets": [
+        {"expr": "sum(increase(etl_reconciliation_evaluations_total[1d])) by (result)", "legendFormat": "{{result}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Target table registry by state",
+      "gridPos": {"x": 12, "y": 14, "w": 12, "h": 7},
+      "targets": [
+        {"expr": "sum(etl_target_table_count) by (state)", "legendFormat": "{{state}}"}
+      ]
+    }
+  ]
+}

@@ -25,6 +25,8 @@ public interface EtlTargetTableRepository extends JpaRepository<EtlTargetTable, 
 
     List<EtlTargetTable> findByState(String state);
 
+    long countByState(String state);
+
     /** ACTIVE 且 task 已删除，或 task 已终态且超过 cutoff → 孤儿候选。 */
     @Query("SELECT t FROM EtlTargetTable t WHERE t.state = 'ACTIVE' AND NOT EXISTS ("
             + "SELECT 1 FROM EtlTask e WHERE e.taskId = t.taskId AND ("

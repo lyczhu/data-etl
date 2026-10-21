@@ -13,7 +13,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Phase 2C：{@code etl.outbox.enabled=true} 时 publisher/poller 的条件装配正确，且不产生双 publisher。
  */
-@SpringBootTest(properties = "etl.outbox.enabled=true")
+@SpringBootTest(properties = {"etl.outbox.enabled=true", "etl.outbox.poll-interval-ms=3600000"})
 class OutboxWiringIT extends AbstractOrchestratorIT {
 
     @Autowired

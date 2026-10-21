@@ -1,6 +1,8 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator.target;
 
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -43,11 +45,19 @@ public class TargetTableRegistry {
     public TargetTableRegistry(EtlTargetTableRepository repository,
                                JdbcTemplate jdbc,
                                DataSource orchestratorDataSource,
-                               TargetTableProperties properties) {
+                               TargetTableProperties properties,
+                               MeterRegistry meterRegistry) {
         this.repository = repository;
         this.jdbc = jdbc;
         this.orchestratorDataSource = orchestratorDataSource;
         this.properties = properties;
+        for (String state : List.of(EtlTargetTable.ACTIVE, EtlTargetTable.ORPHANED,
+                EtlTargetTable.PURGED)) {
+            Gauge.builder("etl.target.table.count", repository, r -> r.countByState(state))
+                    .tag("state", state)
+                    .description("目标表登记数（按状态）")
+                    .register(meterRegistry);
+        }
     }
 
     /** 提交前冲突检查：同名表已归其它 task 时拒绝。 */

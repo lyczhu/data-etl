@@ -1,6 +1,7 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator.target;
 
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -29,7 +30,7 @@ class TargetTableRegistryTest {
     void setUp() {
         repository = mock(EtlTargetTableRepository.class);
         registry = new TargetTableRegistry(repository, mock(JdbcTemplate.class),
-                mock(DataSource.class), new TargetTableProperties());
+                mock(DataSource.class), new TargetTableProperties(), new SimpleMeterRegistry());
     }
 
     @Test

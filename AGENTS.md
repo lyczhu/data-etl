@@ -15,7 +15,7 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
   proves nothing about them — always check `Skipped: 0` in the `-Pit` output). Any Redis answering on `localhost:6379`
   works, since the ITs only use it for Redisson locks — if another local stack already holds that port, the repo's own
   `redis` container is unnecessary (compose failing to bind it is harmless for the ITs). They use a dedicated
-  database `etl_it` (auto-created, schema applied from `db/schema/02|05|06`) and per-JVM Kafka topic names, so they never
+  database `etl_it` (auto-created, schema applied from `db/schema/00|02|05|06|07|08|09|10|11`) and per-JVM Kafka topic names, so they never
   touch the `etl_system` database used by the e2e runbook.
 - `FullChainE2EIT` boots the real `etl-worker` Spring context in the same test JVM (test-scope dependency on `etl-worker`);
   that is why its repackage goal publishes an `-exec` classifier jar and keeps the plain jar as the main artifact.
@@ -100,6 +100,10 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
 - Lease expiry is a **database** fact: `CheckpointWriter` writes `lease_until` as `now() + interval` on both acquire
   and renew. A JVM `Timestamp` lands in a `timestamp without time zone` column and is compared against `now()`
   (timestamptz) with a timezone offset, delaying takeover by hours; the Phase 1C S3 kill drill caught an 8-hour skew.
+- Phase 2 governance: `db/schema` is the **only** schema source (`ddl-auto=validate`); new entity columns require a
+  DDL migration first. `etl_task_audit` is written only by `AuditWriter` inside `OrchestratorService.transition`'s
+  transaction (INV-9). `DispatchService` must `markAssigned` before writing the outbox row; target-table cleanup is
+  dry-run by default and may `DROP` only `ORPHANED` rows.
 
 ## Toolchain
 

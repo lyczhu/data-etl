@@ -118,3 +118,69 @@ groups:
           summary: "checkpoint 写入停滞"
           description: "全局 checkpoint 最近写入距今 > 300s；worker 可能停摆或 lease 被占。"
 
+  # Phase 2 治理面告警：审计 / Outbox / 对账 / 目标表。
+  - name: etl-phase2-governance-alerts
+    rules:
+      - alert: EtlAuditWriteFailures
+        expr: increase(etl_audit_write_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "状态迁移审计写入失败"
+          description: "审计与状态写同事务，失败意味着迁移已回滚；查 task-management 日志与 DB 可用性。"
+
+      - alert: EtlOutboxBacklogStuck
+        expr: max(etl_outbox_oldest_pending_age_seconds) > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Outbox 最老待投递行超过 5 分钟"
+          description: "poller 可能停止/拿不到锁/Kafka 不可用；查 etl_outbox 与 OutboxPoller 日志。"
+
+      - alert: EtlOutboxSendFailures
+        expr: increase(etl_outbox_send_failures_total[10m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox 投递失败升高"
+          description: "10m 内失败 > 5 次；检查 Kafka 与 last_error，必要时回滚 etl.outbox.enabled=false。"
+
+      - alert: EtlOutboxPendingHigh
+        expr: max(etl_outbox_pending) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox 待投递积压"
+          description: "待投递行 > 1000 持续 10m；检查 poller 吞吐与 Kafka 分区。"
+
+      - alert: EtlReconciliationMismatch
+        expr: increase(etl_reconciliation_evaluations_total{result="MISMATCH"}[1d]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "对账发现不一致"
+          description: "查 GET /api/reconciliation/{runId}；不要直接改状态，先确认源/目标/幂等键。"
+
+      - alert: EtlReconciliationError
+        expr: increase(etl_reconciliation_evaluations_total{result="ERROR"}[1d]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "对账执行失败"
+          description: "外部库连接/表缺失等；查 reconciliation details 与数据源配置。"
+
+      - alert: EtlTargetTableOrphaned
+        expr: max(etl_target_table_count{state="ORPHANED"}) > 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "存在待清理孤儿目标表"
+          description: "先 dry-run：POST /api/admin/target-tables/cleanup?dryRun=true，确认后再 false。"
+
