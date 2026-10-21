@@ -5,6 +5,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
 import com.lawyus.dataetl.taskmanagement.orchestrator.validate.RunValidator;
+import com.lawyus.dataetl.taskmanagement.orchestrator.target.TargetTableRegistry;
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,6 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.Date;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -32,6 +34,9 @@ public class EtlTaskService {
 
     @Autowired
     private RoutingProperties routing;
+
+    @Autowired
+    private TargetTableRegistry targetTableRegistry;
 
     public List<EtlTask> getAllTasks() {
         return etlTaskRepository.findAll();
@@ -69,7 +74,10 @@ public class EtlTaskService {
 
         String uniqueTableName = generateUniqueTableName(task.getSourceTableName(), taskId);
         task.setTargetTableName(uniqueTableName);
+        // Phase 2E：同一目标库上的表名只能归一个 task；冲突在落库前拒绝
+        targetTableRegistry.assertAvailable(task.getTargetDataSourceId(), uniqueTableName, taskId);
         EtlTask saved = etlTaskRepository.save(task);
+        targetTableRegistry.register(saved);
 
         // 影子切换（orchestrator-design.md §7.1/§11.2 + v2 WP-16）：总开关 + dataSource 白名单；
         // 关闭时保持旧行为（status="new" 由旧 TaskScheduler 驱动），e2e 零影响。
@@ -95,9 +103,10 @@ public class EtlTaskService {
         EtlTask task = etlTaskRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Task not found with id " + id));
 
-        task.setDataSourceId(taskDetails.getDataSourceId());
-        task.setSourceTableName(taskDetails.getSourceTableName());
-        task.setTargetTableName(taskDetails.getTargetTableName());
+        // Phase 2E：源/目标定位在创建后冻结；null 视为“未提供”以兼容部分更新
+        assertNotChanged(task.getDataSourceId(), taskDetails.getDataSourceId(), "dataSourceId");
+        assertNotChanged(task.getSourceTableName(), taskDetails.getSourceTableName(), "sourceTableName");
+        assertNotChanged(task.getTargetTableName(), taskDetails.getTargetTableName(), "targetTableName");
         // 封堵绕过状态机的口子（orchestrator-design.md §9）：status 与派生计数
         // （totalRecords/completedRecords）从可更新集合中移除，仅允许改非状态字段。
         // status 的唯一写路径是 OrchestratorService.transition()；计数由 checkpoint 投影。
@@ -107,7 +116,17 @@ public class EtlTaskService {
     }
 
     public void deleteTask(@NonNull Long id) {
+        EtlTask task = etlTaskRepository.findById(id).orElse(null);
         etlTaskRepository.deleteById(id);
+        if (task != null) {
+            targetTableRegistry.markOrphaned(task.getTaskId());
+        }
+    }
+
+    private static void assertNotChanged(Object current, Object incoming, String field) {
+        if (incoming != null && !Objects.equals(current, incoming)) {
+            throw new IllegalArgumentException(field + " is immutable after task creation");
+        }
     }
 
     /**

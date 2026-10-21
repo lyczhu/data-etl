@@ -3,10 +3,12 @@ package com.lawyus.dataetl.taskmanagement.controller;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorCommandService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.audit.AuditService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskAudit;
+import com.lawyus.dataetl.taskmanagement.orchestrator.target.TargetTableConflictException;
 import com.lawyus.dataetl.taskmanagement.service.EtlTaskService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.MediaType;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
@@ -16,11 +18,13 @@ import java.util.List;
 
 import org.springframework.data.domain.PageImpl;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -82,6 +86,19 @@ class EtlTaskControllerTest {
                 .thenThrow(new IllegalArgumentException("task not found: missing"));
         mvc.perform(get("/api/tasks/missing/audit"))
                 .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("目标表冲突 → 409；冻结字段修改 → 400")
+    void targetTableConflictAndFrozenFieldsMapped() throws Exception {
+        when(taskService.createTask(any())).thenThrow(new TargetTableConflictException("already owned"));
+        mvc.perform(post("/api/tasks").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isConflict());
+
+        when(taskService.updateTask(org.mockito.ArgumentMatchers.eq(1L), any()))
+                .thenThrow(new IllegalArgumentException("targetTableName is immutable after task creation"));
+        mvc.perform(put("/api/tasks/1").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadRequest());
     }
 
     @Test

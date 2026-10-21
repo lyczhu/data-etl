@@ -89,6 +89,11 @@ etl:
     lookback-hours: 48
     batch-size: 100
     query-timeout-seconds: 30
+  # Phase 2E：目标表登记/孤儿标记（只标记，不自动删表）
+  target-table:
+    cleanup-enabled: true
+    orphan-retention-days: 7
+    orphan-cron: "0 0 4 * * *"
   # 派工与背压（§5.4 / §7.2）；令牌桶容量 = max-concurrent-shards
   dispatch:
     pump-batch: 50

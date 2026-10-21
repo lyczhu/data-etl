@@ -5,6 +5,7 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
 import com.lawyus.dataetl.taskmanagement.orchestrator.validate.RunValidator;
+import com.lawyus.dataetl.taskmanagement.orchestrator.target.TargetTableRegistry;
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -24,6 +25,7 @@ class EtlTaskServiceSubmitTest {
     private OrchestratorService orchestrator;
     private RunValidator runValidator;
     private RoutingProperties routing;
+    private TargetTableRegistry targetTableRegistry;
     private EtlTaskService service;
 
     @BeforeEach
@@ -32,11 +34,13 @@ class EtlTaskServiceSubmitTest {
         orchestrator = mock(OrchestratorService.class);
         runValidator = mock(RunValidator.class);
         routing = new RoutingProperties();
+        targetTableRegistry = mock(TargetTableRegistry.class);
         service = new EtlTaskService();
         ReflectionTestUtils.setField(service, "etlTaskRepository", etlTaskRepository);
         ReflectionTestUtils.setField(service, "orchestrator", orchestrator);
         ReflectionTestUtils.setField(service, "runValidator", runValidator);
         ReflectionTestUtils.setField(service, "routing", routing);
+        ReflectionTestUtils.setField(service, "targetTableRegistry", targetTableRegistry);
         when(etlTaskRepository.save(org.mockito.ArgumentMatchers.any(EtlTask.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
     }

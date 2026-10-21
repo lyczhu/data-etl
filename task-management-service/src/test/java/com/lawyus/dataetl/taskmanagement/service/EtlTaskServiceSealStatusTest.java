@@ -10,6 +10,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -36,6 +37,9 @@ class EtlTaskServiceSealStatusTest {
         existing.setTotalRecords(100L);
         existing.setCompletedRecords(50L);
         existing.setDescription("old");
+        existing.setDataSourceId(1L);
+        existing.setSourceTableName("src");
+        existing.setTargetTableName("tgt");
         when(repository.findById(1L)).thenReturn(Optional.of(existing));
         when(repository.save(any(EtlTask.class))).thenAnswer(inv -> inv.getArgument(0));
     }
@@ -48,7 +52,7 @@ class EtlTaskServiceSealStatusTest {
         payload.setTotalRecords(999L);
         payload.setCompletedRecords(999L);
         payload.setDescription("new");
-        payload.setDataSourceId(7L);
+        payload.setDataSourceId(1L);
         payload.setSourceTableName("src");
         payload.setTargetTableName("tgt");
 
@@ -57,9 +61,21 @@ class EtlTaskServiceSealStatusTest {
         assertThat(result.getStatus()).isEqualTo("RUNNING");   // 未被请求体覆盖
         assertThat(result.getTotalRecords()).isEqualTo(100L);
         assertThat(result.getCompletedRecords()).isEqualTo(50L);
-        // 非状态字段正常更新
+        // 非状态字段正常更新；源/目标定位保持不变
         assertThat(result.getDescription()).isEqualTo("new");
-        assertThat(result.getDataSourceId()).isEqualTo(7L);
+        assertThat(result.getDataSourceId()).isEqualTo(1L);
         assertThat(result.getTargetTableName()).isEqualTo("tgt");
+    }
+
+    @Test
+    @DisplayName("创建后尝试改 source/target：拒绝（Phase 2E 冻结）")
+    void immutableFieldsRejected() {
+        EtlTask payload = new EtlTask();
+        payload.setDescription("new");
+        payload.setTargetTableName("other_table");
+
+        assertThatThrownBy(() -> service.updateTask(1L, payload))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("immutable");
     }
 }

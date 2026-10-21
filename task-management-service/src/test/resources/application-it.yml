@@ -73,6 +73,8 @@ etl:
     retention-days: 7
   reconciliation:
     enabled: false
+  target-table:
+    cleanup-enabled: false
   orchestrator:
     max-attempts: 3
     dispatch-heartbeat-timeout: 100d

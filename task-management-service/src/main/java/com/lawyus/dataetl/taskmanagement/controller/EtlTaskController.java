@@ -5,8 +5,10 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.audit.AuditService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorCommandService;
+import com.lawyus.dataetl.taskmanagement.orchestrator.target.TargetTableConflictException;
 import com.lawyus.dataetl.taskmanagement.service.EtlTaskService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -61,6 +63,17 @@ public class EtlTaskController {
     public ResponseEntity<Void> deleteTask(@PathVariable(value = "id") Long taskId) {
         etlTaskService.deleteTask(taskId);
         return ResponseEntity.noContent().build();
+    }
+
+    /** Phase 2E：目标表归属冲突 → 409；冻结字段被修改 → 400。 */
+    @ExceptionHandler(TargetTableConflictException.class)
+    public ResponseEntity<String> targetTableConflict(TargetTableConflictException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(e.getMessage());
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<String> badRequest(IllegalArgumentException e) {
+        return ResponseEntity.badRequest().body(e.getMessage());
     }
 
     // --- 编排器人工干预 API（WP-14 / Gate 2 最小闭环） ---

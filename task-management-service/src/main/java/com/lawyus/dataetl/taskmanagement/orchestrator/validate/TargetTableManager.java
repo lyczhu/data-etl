@@ -5,6 +5,7 @@ import com.lawyus.dataetl.connector.spi.jdbc.JdbcSinkWriter;
 import com.lawyus.dataetl.connector.spi.model.TableSchema;
 import com.lawyus.dataetl.taskmanagement.client.DataSourceServiceClient;
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
+import com.lawyus.dataetl.taskmanagement.orchestrator.target.TargetTableRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -40,11 +41,14 @@ public class TargetTableManager {
 
     private final DataSourceServiceClient dataSourceServiceClient;
     private final javax.sql.DataSource orchestratorDataSource;
+    private final TargetTableRegistry targetTableRegistry;
 
     public TargetTableManager(DataSourceServiceClient dataSourceServiceClient,
-                              javax.sql.DataSource orchestratorDataSource) {
+                              javax.sql.DataSource orchestratorDataSource,
+                              TargetTableRegistry targetTableRegistry) {
         this.dataSourceServiceClient = dataSourceServiceClient;
         this.orchestratorDataSource = orchestratorDataSource;
+        this.targetTableRegistry = targetTableRegistry;
     }
 
     /** V-3：确保目标表可写（表存在且带 idempotency_key 唯一键）。失败抛 {@link IllegalStateException}。 */
@@ -65,6 +69,8 @@ public class TargetTableManager {
                 }
                 ensureIdempotencyKey(conn, target.type(), table);
                 conn.commit();
+                // Phase 2E：表就绪后登记归属（createTask 已登记时按幂等处理）
+                targetTableRegistry.register(task);
                 log.info("target table ready: table={} type={} targetDataSource={}",
                         table, target.type(), task.getTargetDataSourceId());
             } catch (SQLException | RuntimeException e) {
