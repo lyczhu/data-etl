@@ -21,6 +21,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -150,21 +151,24 @@ class DispatchServicePumpTest {
     }
 
     @Test
-    @DisplayName("发送失败：分片保持 PENDING、归还全部预留许可、不触发 T5")
-    void publishFailureKeepsPendingAndReleases() {
+    @DisplayName("发送失败：异常上抛以回滚 ASSIGNED，不触发 T5")
+    void publishFailureRollsBackAssignment() {
         when(checkpointRepository.countPendingShards("run-1")).thenReturn(2L);
         when(tokenBucket.tryAcquireUpTo(2)).thenReturn(2);
         when(checkpointRepository.findPendingShards(eq("run-1"), any(Pageable.class)))
                 .thenReturn(List.of(shard("shard-0"), shard("shard-1")));
         when(assembler.assemble(any(), any())).thenReturn(new ShardDispatchCommand());
+        when(checkpointRepository.markAssigned(anyString(), anyString(), anyString(), anyInt())).thenReturn(1);
         org.mockito.Mockito.doThrow(new IllegalStateException("broker down"))
                 .when(publisher).publish(any());
 
-        service.dispatchOne(run("QUEUED"));
+        assertThatThrownBy(() -> service.dispatchOne(run("QUEUED")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("broker down");
 
-        verify(checkpointRepository, never()).markAssigned(anyString(), anyString(), anyString(), anyInt());
+        // Phase 2C：CAS 先发生，publish 失败必须把异常抛回事务边界触发回滚
+        verify(checkpointRepository).markAssigned("task-1", "run-1", "shard-0", 1);
         verify(orchestrator, never()).transition(any(), any(), any(), any());
-        verify(tokenBucket).release(2);
     }
 
     @Test
@@ -181,6 +185,7 @@ class DispatchServicePumpTest {
 
         verify(tokenBucket).release(1);
         verify(metrics, never()).dispatchShardPublished();
+        verify(publisher, never()).publish(any());
         verify(orchestrator, never()).transition(any(), any(), any(), any());
     }
 

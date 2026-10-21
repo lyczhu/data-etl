@@ -67,6 +67,10 @@ etl:
     commands: it.etl.task.commands
   audit:
     retention-days: 180
+  outbox:
+    enabled: false
+    poll-interval-ms: 60000
+    retention-days: 7
   orchestrator:
     max-attempts: 3
     dispatch-heartbeat-timeout: 100d

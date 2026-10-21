@@ -74,6 +74,14 @@ etl:
   audit:
     retention-days: 180
     retention-cron: "0 0 3 * * *"
+  # Phase 2C：派工 Outbox；false = 直投 Kafka（回滚开关）
+  outbox:
+    enabled: false
+    poll-interval-ms: 1000
+    batch-size: 200
+    max-attempts: 5
+    backoff-seconds: [1, 5, 30, 120, 600]
+    retention-days: 7
   # 派工与背压（§5.4 / §7.2）；令牌桶容量 = max-concurrent-shards
   dispatch:
     pump-batch: 50

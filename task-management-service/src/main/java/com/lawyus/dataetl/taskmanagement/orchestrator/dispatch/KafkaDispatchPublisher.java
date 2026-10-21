@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
@@ -16,10 +17,12 @@ import java.util.concurrent.TimeUnit;
  *   <li>key = {@code runId:shardId}：同一 task 的不同分片分散到不同分区，修复 I1 单任务串行；</li>
  *   <li>发送<b>等待 broker ack</b>（{@code send(...).get(timeout)}）：失败抛异常，由 DispatchService
  *       保持 PENDING、不标 ASSIGNED，下轮补派；</li>
- *   <li>Phase 1B 切最小 outbox 后，本类可保持不变（publisher 接口不变）。</li>
+ *   <li>Phase 2C：{@code etl.outbox.enabled=true} 时由 {@code OutboxDispatchPublisher} 取代本类；
+ *       本类作为回滚开关（false/缺省）保留。</li>
  * </ul>
  */
 @Component
+@ConditionalOnProperty(prefix = "etl.outbox", name = "enabled", havingValue = "false", matchIfMissing = true)
 public class KafkaDispatchPublisher implements DispatchPublisher {
 
     private static final Logger log = LoggerFactory.getLogger(KafkaDispatchPublisher.class);

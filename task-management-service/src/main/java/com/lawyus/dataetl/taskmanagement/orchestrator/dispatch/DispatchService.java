@@ -37,8 +37,9 @@ import java.util.List;
  *   <li>{@code QUEUED→DISPATCHED}（T5）只在 run 仍为 QUEUED 时发生一次。</li>
  * </ul>
  *
- * <p>事务边界：{@link #dispatchOne} 经自注入代理（{@code @Lazy}）调用，使"分片置 ASSIGNED + T5 迁移"原子。
- * Phase 1B 切最小 outbox 前，消息在事务内直投（失败抛异常回滚，分片保持 PENDING）。
+ * <p>事务边界：{@link #dispatchOne} 经自注入代理（{@code @Lazy}）调用，使"分片置 ASSIGNED + 入箱 + T5 迁移"原子。
+ * Phase 2C：CAS 成功后才 {@code publisher.publish}；发布失败抛异常回滚，分片保持 PENDING。
+ * outbox 模式下 publish 只写库（{@code OutboxDispatchPublisher}），由 poller 异步投递。
  */
 @Component
 public class DispatchService {
@@ -98,7 +99,12 @@ public class DispatchService {
             List<EtlTaskRun> runs = runRepository.findDispatchableRuns(
                     PageRequest.of(0, dispatchProperties.getPumpBatch()));
             for (EtlTaskRun run : runs) {
-                self.dispatchOne(run);
+                try {
+                    self.dispatchOne(run);
+                } catch (RuntimeException e) {
+                    // 发布失败会回滚本 run 的事务（分片回到 PENDING），不能中断其它 run 的补派
+                    log.error("pump: run={} dispatch aborted: {}", run.getRunId(), e.getMessage(), e);
+                }
             }
         } finally {
             if (lock.isHeldByCurrentThread()) {
@@ -135,34 +141,53 @@ public class DispatchService {
         int dispatched = 0;
         int released = 0;
         for (EtlTaskCheckpoint shard : shards) {
+            ShardDispatchCommand cmd;
             try {
-                ShardDispatchCommand cmd = assembler.assemble(run, shard);
-                publisher.publish(cmd);   // 等待 broker ack；失败抛异常
+                cmd = assembler.assemble(run, shard);
+            } catch (RuntimeException e) {
+                log.error("pump: run={} shard={} assemble failed, keep PENDING: {}",
+                        runId, shard.getShardId(), e.getMessage(), e);
+                break;
+            }
+
+            int updated;
+            try {
                 // CAS：只有真正从 PENDING 转出才计成功；并发泵已派则归还令牌
-                int updated = checkpointRepository.markAssigned(
+                updated = checkpointRepository.markAssigned(
                         run.getTaskId(), runId, shard.getShardId(), attempt);
-                if (updated == 0) {
-                    tokenBucket.release(1);
-                    released++;
-                    continue;
-                }
-                dispatched++;
-                metrics.dispatchShardPublished();
-                if (firstQueued) {
+            } catch (RuntimeException e) {
+                log.error("pump: run={} shard={} markAssigned failed, keep PENDING: {}",
+                        runId, shard.getShardId(), e.getMessage(), e);
+                break;
+            }
+            if (updated == 0) {
+                tokenBucket.release(1);
+                released++;
+                continue;
+            }
+
+            try {
+                // Phase 2C：只有 CAS 成功后才入箱/直投；发布失败必须回滚 markAssigned
+                publisher.publish(cmd);
+            } catch (RuntimeException e) {
+                log.error("pump: run={} shard={} publish failed, rolling back ASSIGNED: {}",
+                        runId, shard.getShardId(), e.getMessage(), e);
+                throw e;
+            }
+
+            dispatched++;
+            metrics.dispatchShardPublished();
+            if (firstQueued) {
+                try {
                     // T5：首片派出时 run 跃迁 QUEUED → DISPATCHED（仅一次）
                     TransitionContext ctx = TransitionContext.builder(run.getTaskId())
                             .reason("DISPATCH").actor("orchestrator:dispatch").build();
                     orchestrator.transition(runId, EtlTaskStatus.QUEUED, EtlTaskStatus.DISPATCHED, ctx);
                     firstQueued = false;
+                } catch (GuardFailureException | IllegalStateTransitionException e) {
+                    log.warn("pump: run={} shard={} dispatch skipped: {}", runId, shard.getShardId(), e.getMessage());
+                    break;
                 }
-            } catch (GuardFailureException | IllegalStateTransitionException e) {
-                log.warn("pump: run={} shard={} dispatch skipped: {}", runId, shard.getShardId(), e.getMessage());
-                break;
-            } catch (RuntimeException e) {
-                // 组装/发送失败：分片保持 PENDING，下轮补派；不污染状态机
-                log.error("pump: run={} shard={} dispatch failed, keep PENDING: {}",
-                        runId, shard.getShardId(), e.getMessage(), e);
-                break;
             }
         }
         int unused = permits - dispatched - released;
