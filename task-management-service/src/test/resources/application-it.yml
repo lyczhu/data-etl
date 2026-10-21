@@ -71,6 +71,8 @@ etl:
     enabled: false
     poll-interval-ms: 60000
     retention-days: 7
+  reconciliation:
+    enabled: false
   orchestrator:
     max-attempts: 3
     dispatch-heartbeat-timeout: 100d

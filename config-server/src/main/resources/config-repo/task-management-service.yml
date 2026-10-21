@@ -82,6 +82,13 @@ etl:
     max-attempts: 5
     backoff-seconds: [1, 5, 30, 120, 600]
     retention-days: 7
+  # Phase 2D：每日对账（近 48h 终态 run）
+  reconciliation:
+    enabled: true
+    cron: "0 30 2 * * *"
+    lookback-hours: 48
+    batch-size: 100
+    query-timeout-seconds: 30
   # 派工与背压（§5.4 / §7.2）；令牌桶容量 = max-concurrent-shards
   dispatch:
     pump-batch: 50
