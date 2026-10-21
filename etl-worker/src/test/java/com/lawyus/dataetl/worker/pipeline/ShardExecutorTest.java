@@ -91,7 +91,7 @@ class ShardExecutorTest {
         when(checkpointWriter.tryAcquireLease(anyString(), anyString(), anyString(), anyInt(),
                 anyString(), anyLong())).thenReturn(1);
         when(checkpointWriter.renewLease(anyString(), anyString(), anyString(), anyString(),
-                anyInt(), any())).thenReturn(1);
+                anyInt(), anyLong())).thenReturn(1);
     }
 
     private ShardExecutor executor(FakeSource source, RecordTransformer transformer) {

@@ -826,6 +826,8 @@ MDC 字段扩展为 `traceId, spanId, taskId, runId, shardId, attemptNo, statusF
 
 两个适配器只负责“把旧消息翻译成 (from, to, reason)”，不得直接存库。这使方案 §7.1 的回滚开关 `etl.routing.newWorker=false` 能全退旧链路而不会退旧状态模型。
 
+灰度白名单（WP-16）：所有路由判定必须使用 `RoutingProperties.isNewWorkerFor(dataSourceId)`，不能使用全局 `isNewWorker()`。旧链路终态监听器（`TaskCompletedListener`/`TaskFailedListener`）同样如此；白名单外任务没有 run 行，误走状态机会被跳过并永久卡在 `running`。
+
 ### 11.3 单点守卫的机械校验
 
 ```powershell

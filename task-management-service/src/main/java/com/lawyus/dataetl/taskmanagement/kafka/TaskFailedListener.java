@@ -10,10 +10,10 @@ import com.lawyus.dataetl.taskmanagement.orchestrator.TransitionContext;
 import com.lawyus.dataetl.taskmanagement.orchestrator.adapter.LegacyStatusAdapter;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.RoutingProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
+import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
 import com.lawyus.dataetl.taskmanagement.service.EtlTaskService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
@@ -23,23 +23,25 @@ import java.util.Optional;
  * 消费数据拉取服务重试耗尽后发出的 task-failed 通知。
  * 修复：原链路中 extraction 失败仅记录日志、任务卡在 running 永不回滚的问题。
  *
- * <p>影子切换（{@code orchestrator-design.md §11.2/D-25}）：{@code newWorker=false} 走旧 {@code markFailed} 直写；
- * {@code true} 经 {@link LegacyStatusAdapter}（FAILED → {@code NEEDS_ATTENTION}，"宁可多告不漏告" §11.1）收敛到
- * {@link OrchestratorService#transition} 唯一入口，不直写 status。
+ * <p>影子切换（{@code orchestrator-design.md §11.2/D-25}）：任务所属 dataSource 未命中灰度白名单时走旧
+ * {@code markFailed} 直写；命中白名单时经 {@link LegacyStatusAdapter}（FAILED → {@code NEEDS_ATTENTION}，
+ * "宁可多告不漏告" §11.1）收敛到 {@link OrchestratorService#transition} 唯一入口，不直写 status。
  */
 @Component
 public class TaskFailedListener {
     private static final Logger log = LoggerFactory.getLogger(TaskFailedListener.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final EtlTaskService etlTaskService;
+    private final OrchestratorService orchestrator;
+    private final RoutingProperties routing;
 
-    @Autowired
-    private EtlTaskService etlTaskService;
-
-    @Autowired
-    private OrchestratorService orchestrator;
-
-    @Autowired
-    private RoutingProperties routing;
+    public TaskFailedListener(EtlTaskService etlTaskService,
+                              OrchestratorService orchestrator,
+                              RoutingProperties routing) {
+        this.etlTaskService = etlTaskService;
+        this.orchestrator = orchestrator;
+        this.routing = routing;
+    }
 
     @KafkaListener(topics = "${etl.topics.task-failed}", groupId = "task-management-group")
     public void listen(String taskFailedMessage) {
@@ -51,7 +53,13 @@ public class TaskFailedListener {
                 log.warn("Received task-failed message without taskId: {}", taskFailedMessage);
                 return;
             }
-            if (routing.isNewWorker()) {
+            EtlTask task = etlTaskService.getTaskByTaskId(taskId);
+            if (task == null) {
+                log.warn("task-failed: task not found task={}", taskId);
+                return;
+            }
+            // 灰度按 dataSource 白名单判定：白名单外任务仍走旧链路 markFailed
+            if (routing.isNewWorkerFor(task.getDataSourceId())) {
                 routeToStateMachine(taskId, reason);
             } else {
                 etlTaskService.markFailed(taskId, reason);

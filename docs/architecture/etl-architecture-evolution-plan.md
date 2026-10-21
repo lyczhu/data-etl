@@ -99,7 +99,7 @@ v1 文档中“数据面接线已落地”“端到端可运行”“影子切�
 5. **at-least-once + 幂等**：不宣称 exactly-once；所有数据面写入必须可重放。
 6. **安全默认**：凭据不落消息、不落日志；DB 加密；密钥可轮换。
 7. **低基数可观测**：taskId 只进日志/DB，不进指标标签。
-8. **先小后大**：先用 1 个 dataSource 灰度，再 25/50/100。
+8. **先小后大**：先用 1 个 dataSource 做接入测试（小表→大表→断点续跑），全过即全量。
 
 ### 2.2 目标组件
 
@@ -172,19 +172,19 @@ POST /api/tasks
 
 ## 4. 阶段路线图
 
-> 时间按“10 人、3 个并行 stream、无独立 SRE”估算；关键路径（崩溃续跑、幂等、30M 压测、灰度观察）不因加人而压缩。每个阶段必须有可验证的退出条件，不以“代码写完”作为完成。
+> 时间按“10 人、3 个并行 stream、无独立 SRE”估算；关键路径（崩溃续跑、幂等、30M 压测、灰度验收）不因加人而压缩。每个阶段必须有可验证的退出条件，不以“代码写完”作为完成。
 
 | 阶段 | 时间盒（10 人） | 关键路径 / 不可压缩项 |
 |---|---|---|
 | Phase 0 | 1 周 | 基线、端口、路由 |
 | Phase 1A | 3 周 | 崩溃续跑 + 幂等 + 30M 压测；10 人并行但关键路径不变 |
 | Phase 1B | 2~3 周 | 多实例、收敛、API、回滚；可与 Phase 1A 后半段并行设计 |
-| Phase 1C | 4 周 | 1 个 dataSource 7 天 + 25/50/100 各 1 周；观察期不可压缩 |
+| Phase 1C | 1~2 天 | 3 轮接入测试（小表/中表/大表+断点续跑）；通过即收口，不设日历观察期 |
 | Phase 2 | 4~6 周 | 多源 connector/治理；可并行 2 个 connector stream |
 | Phase 3 | 4~6 周（条件） | stream runtime；业务未确认则跳过 |
-| Phase 4 | 1~2 周 | 旧链路 drain/删除；依赖 100% 运行 ≥2 周 |
+| Phase 4 | 1~2 周 | 旧链路 drain/删除；依赖全量后 20 个生产任务零 P0 |
 
-> 10 人不是把 Phase 1 砍到 5 周：开发部分约 6 周，灰度观察 4 周，合计约 10 周；多出的人力用于并行测试、安全、可观测性和 Phase 2 预研。
+> 10 人不是把 Phase 1 砍到 5 周：开发部分约 6 周，灰度以 3 轮接入测试收口（含故障续跑，约 1~2 天），合计约 6.5 周；多出的人力用于并行测试、安全、可观测性和 Phase 2 预研。
 
 ### Phase 0 · 收尾与基线（1 周）
 
@@ -294,24 +294,75 @@ POST /api/tasks
 - [x] **WP-18 契约与文档**：`KafkaContractTest` 锁 dispatch/results/progress/dlt 字段与“派工不含连接/口令”；`orchestrator-design.md`、`connector-spi.md`、`AGENTS.md` 同步 lease/DB 许可/V-3 约束。
 - [x] **Gate 2 环境型证据（2026-10-19）**：两个独立 task-management JVM（8082/8092，共享 DB）在 `max-concurrent-shards=4` 下稳定保持 4 个 ASSIGNED，Kafka 每 shard 恰好 1 条派工消息；杀掉一个实例后另一个继续补派。两个独立 worker 进程（不同消费组）验证了 lease 互斥、接管与旧 owner 迟到写入被拒。Prometheus/Alertmanager 实际触发 `EtlCheckpointLagHigh`、`EtlRunNeedsAttention`、`EtlDltUnresolved`，webhook 收到投递。回滚演练（`new-worker=false` + `/abort` T26）后无孤儿 run、无重复写入，并用旧链路完成任务 `2883cdda...`（100 行）验证接管。环境验证发现并修复 `globalMaxUpdatedAt` 未限定活跃 run 导致空闲误报 lag 的缺陷，新增 `CheckpointLagMetricIT`。证据：`e2e-logs/phase1b-gate2-evidence.md`。
 
-> 结论：Phase 1B 的代码与 Gate 1/2 本地证据已收口（`mvn test` 141 例、`-Pit` 51 例，0 failures/0 skipped）；`etl.routing.new-worker` 默认仍为 `false`，Phase 1C 按 `data-source-whitelist` 逐个 dataSource 开启。
+> 结论：Phase 1B 的代码与 Gate 1/2 本地证据已收口（`mvn test` 145 例、`-Pit` 51 例，0 failures/0 skipped）；Phase 1C 已对 `sz-data`(id=10) 开启 `new-worker`，其余 dataSource 仍走旧链路。
 
-### Phase 1C · 灰度（4 周：1 个 dataSource 观察 7 天 + 3 个放量阶段各 1 周）
+### Phase 1C · 灰度接入测试（1~2 天：3 轮接入测试，通过即收口）
 
-**目标**：在真实业务上验证新旧链路一致性和回滚能力。
+**目标**：用可复跑的多表接入测试验证新旧链路一致性、规模上限与回滚能力；不以日历天数作为完成依据。
 
-**步骤**
+**三轮接入测试**
 
-1. 选 1 个 `dataSourceId`，`newWorker=true` + 白名单；其余 dataSource 仍走旧链路。
-2. 影子比对：目标表行数、分片 checksum、终态、耗时；每日报表。
-3. 通过后 25% → 50% → 100%；每阶段观察 1 周。
-4. 任一 P0 指标异常：停止新提交 → 排空/取消在途 run → `newWorker=false` → 旧链路接管。
+| 轮次 | 源表 | 覆盖点 |
+|---|---|---|
+| S1 通路 | `sz_data.p1c_smoke`（100 行） | 建任务→派工→分片终态→目标表落地的最小闭环 |
+| S2 规模 | `sz_data.building`（650,000 行，16 分片） | 全量分片一致性、幂等键、耗时基线 |
+| S3 韧性 | 一张 ≥100 万行表或宽表；run 中途 kill worker 后 `/resume` | 断点续跑不重不漏、lease 接管、规模上限 |
+
+**每轮验收（8 项，全部通过才算该轮通过）**
+
+1. 目标表 `count(*)` = 源表 `count(*)`。
+2. `min/max/sum(主键)` 源目标一致。
+3. `Σcheckpoint.rows_in` = 源行数，且 `pk_from..pk_to` 区间首尾衔接、无缝无叠；逐段 `count + sum(主键)` 由脚本生成源库 SQL 后对照。
+4. `count(distinct idempotency_key)` = 目标表行数。
+5. G-4 四段平衡：`rows_out + rows_filtered + rows_failed + rows_deduped = rows_in`。
+6. `etl_task_run.status` 为终态，且 `shard_succeeded = shard_total`。
+7. 孤儿 run = 0（非终态、无活跃分片、超过 5 分钟无心跳）。
+8. 本 run 未解决 DLT = 0；测试窗口内 P0 告警无 firing（Prometheus 上确认）。
+
+验收脚本：`test-scripts/phase1c-acceptance-check.sql`（按 `run_id` + `target_table` 回放第 1~8 项）。
+
+**异常处置**
+
+- 任一 P0 指标异常：停止新提交 → 排空/取消在途 run → `newWorker=false` → 旧链路接管 → 修复后重跑该轮。
 
 **退出条件（Gate 3）**
 
-- 连续 7 天无数据差异、无 P0 告警、无孤儿 run。
-- 回滚演练在真实 dataSource 上通过。
-- 旧链路至少保留一个可回退版本。
+- S1/S2/S3 三轮 8 项全部通过，证据归档到 `e2e-logs/`。
+- 回滚演练在真实 dataSource 上通过；旧链路至少保留一个可回退版本。
+- 通过后清空 `data-source-whitelist`，`new-worker=true` 全量生效，Phase 1C 结束。
+
+**执行状态（2026-10-19，灰度启动）**
+
+- 灰度数据源：`sz-data`（id=10，`sz_data` 库，PostgreSQL 5432）；源表 `building`（650,000 行）。
+- 路由：`etl.routing.new-worker=true`、`shadow-compare=true`、`data-source-whitelist=[10]`；其余 dataSource 继续走旧链路。
+- 首次 run：`47021610-6154-4903-b50e-cbdc64b2421a`（task `226710d8-...`），16 分片全部 SUCCEEDED，
+  `rows_in=650000 / rows_out=650000 / rows_deduped=0 / rows_failed=0`，耗时 23:31:24–23:34:07（约 163s）。
+- 一致性：源表与目标表 `count=650000`、`min/max(id)=1/650000`、`sum(id)=211250325000` 完全一致；
+  16/16 分片按 `pk_from..pk_to` 逐段比对 `count + sum(id)` 全部一致；目标表 `idempotency_key` 唯一数 650000；
+  `/progress` 返回 16/16。
+- 灰度隔离：非白名单 dataSource=8 的旧链路任务 `a62ebdff-...` 完成 50 行且无 run 行，证明白名单外仍走旧链路。
+- 灰度期间发现并修复：`TaskCompletedListener`/`TaskFailedListener` 误用全局 `isNewWorker()`，白名单外任务完成消息
+  被送入状态机后因无 run 行卡在 `running`；已改为 `isNewWorkerFor(dataSourceId)`，新增 `LegacyListenerRoutingTest` 4 例。
+  首个受影响任务 `9b778bd3-...` 的 50 行数据已正确落表，人工收口后重新验证通过。
+- 修复后 smoke：`sz_data.p1c_smoke`（100 行）run `926c3b5b-...`，15/15 分片 SUCCEEDED，
+  `rows_in=rows_out=100`，目标表 100 行且幂等键唯一。
+- 接入测试进度：S1 通过（`926c3b5b`，100 行）；S2 通过（`47021610`，650,000 行，16/16 分片一致）；
+  S3 待执行（≥100 万行表或宽表 + 中途 kill worker 续跑）。
+- 已知口径：新链路任务的 `etl_task.total_records/completed_records` 仍为 0（旧链路字段），进度以
+  `/api/tasks/{taskId}/progress` 的 run 聚合为准；验收以接入测试 8 项为准。
+- 验收入口：`test-scripts/phase1c-acceptance-check.sql`（`run_id` + `target_table` 参数化，输出 8 项结论）；
+  日常巡检仍可用 `test-scripts/phase1c-daily-check.sql`。
+
+**收口（2026-10-21，Gate 3 通过）**
+
+- S3 韧性：源表 `sz_data.p1c_large`（1,200,000 行切片），run `3eda03f5-...`；进度 235,000 行时硬杀 worker，
+  3 SUCCEEDED / 1 RUNNING / 12 ASSIGNED 停住；重启后由过期 lease 接管并续跑，16/16 SUCCEEDED、
+  `rows_in=rows_out=1,200,000`，验收 8/8；跨库逐分片 md5 一致。证据：`e2e-logs/phase1c-s3-evidence.md`。
+- S1/S2 复核：S1 重建 `p1c_smoke`（100 行）后 run `e7ace5a5-...`、S2 run `47021610` 均验收 8/8；S2 跨库 md5 `03200fa1...` 一致。
+- 缺陷修复：`RENEW_LEASE` 曾用 JVM 本地 `Timestamp`，与 DB `now()` 相差 8 小时时区偏移，崩溃接管被推迟；
+  已改为 `now() + interval` 并加 SQL 契约断言。`mvn test` 全仓 BUILD SUCCESS（worker 35、task-management 84）。
+- 全量开通：`data-source-whitelist` 清空（空 = 全部走新链路）；原旧链路 dataSource=8 回归 run `0dd9569e-...`
+  13/13 SUCCEEDED、50 行、验收 8/8。Phase 1C 结束，回滚开关为 `new-worker=false`。
 
 ### Phase 2 · 多源与治理（4~6 周，Gate 3 之后）
 
@@ -342,8 +393,8 @@ POST /api/tasks
 
 **前置条件**
 
-- 新链路 100% dataSource 运行 ≥2 周。
-- 旧 topic 连续 7 天无生产、lag=0。
+- 新链路全量生效后累计完成 20 个生产任务（其中至少 1 个 ≥10 万行），且零 P0 告警、零孤儿 run、零未解决 DLT。
+- 旧 topic 连续 7 天无生产、lag=0（drain 事实，不受灰度口径影响）。
 - 旧服务无在途任务；旧目标表已归档/确认。
 
 **动作**
@@ -400,15 +451,16 @@ POST /api/tasks
 - `/progress`/`/cancel`/`/failures` 可用；网关路由可达；告警触发。
 - 回滚演练通过。
 
-### Gate 3 · 灰度（Phase 1C 结束）
+### Gate 3 · 灰度接入测试（Phase 1C 结束；2026-10-21 通过）
 
-- 1 个 dataSource 连续 7 天：行数/校验和/终态/耗时无差异。
-- 25/50/100 每阶段观察 1 周；无 P0 告警。
-- 回滚真实演练通过；旧链路可回退。
+- S1/S2/S3 三轮接入测试 8 项全部通过：行数/分片校验和/幂等键/终态/G-4/孤儿 run/DLT 无差异。
+- 至少一轮包含 worker 中途被杀后的断点续跑，结果不重不漏。
+- 测试窗口内无 P0 告警；回滚真实演练通过；旧链路可回退。
+- 通过即清空白名单、`new-worker` 全量生效，Phase 1C 结束。
 
 ### Gate 4 · 旧链路下线（Phase 4）
 
-- 新链路 100% ≥2 周；旧 topic 7 天无生产、lag=0；无在途任务。
+- 新链路全量后累计 20 个生产任务零 P0；旧 topic 7 天无生产、lag=0；无在途任务。
 - 旧服务删除后，监控/告警/runbook 全部指向新链路。
 
 ### 关键指标
@@ -500,5 +552,6 @@ POST /api/tasks
 
 ## 11. 变更记录
 
+- **2026-10-21 v2.1**：Phase 1C 由“4 周日历灰度（7 天观察 + 25/50/100 各 1 周）”改为“3 轮接入测试（小表/中表/大表+断点续跑），8 项验收全过即收口”；通过后清空白名单全量生效；Gate 3、Phase 4 前置与 Gate 4 的“100% ≥2 周”同步改为“20 个生产任务零 P0”。评审报告作为历史快照不改。
 - **2026-10-19 v2.0**：按 `etl-architecture-review-2026-10-19.md` 重制；Phase 1 改为“数据面正确性 Gate”；团队假设由 5 人更新为 10 人；补 `targetDataSourceId`、跨库提交边界、DLT/幂等提前；Phase 1C 明确为 4 周灰度。
 - **v1**：旧版演进计划，见 git 历史。

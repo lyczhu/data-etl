@@ -35,7 +35,6 @@ import javax.sql.DataSource;
 import java.lang.management.ManagementFactory;
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
@@ -320,8 +319,7 @@ public class ShardExecutor {
             // 后续 checkpoint 写入会被 lease fencing 拒绝（此处不打断当前批，避免半批回滚）。
             if (properties.getLeaseSeconds() > 0) {
                 int renewed = checkpointWriter.renewLease(d.getTaskId(), d.getRunId(), d.getShardId(),
-                        leaseOwner, attempt,
-                        new Timestamp(now + properties.getLeaseSeconds() * 1000L));
+                        leaseOwner, attempt, properties.getLeaseSeconds());
                 if (renewed == 0) {
                     log.warn("shard {} lease lost run={} attempt={} owner={}",
                             d.getShardId(), d.getRunId(), attempt, leaseOwner);

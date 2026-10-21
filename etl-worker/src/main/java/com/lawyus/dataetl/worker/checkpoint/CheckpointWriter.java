@@ -6,7 +6,6 @@ import org.springframework.stereotype.Component;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.sql.Timestamp;
 
 /**
  * checkpoint 直写器（worker 是 {@code etl_task_checkpoint} 的唯一写者，写权矩阵 §4.1）。
@@ -73,7 +72,7 @@ public class CheckpointWriter {
             + "  AND (lease_until IS NULL OR lease_until < now() OR lease_owner = ?)";
 
     private static final String RENEW_LEASE =
-            "UPDATE etl_task_checkpoint SET lease_until = ?, updated_at = now() "
+            "UPDATE etl_task_checkpoint SET lease_until = now() + (? * interval '1 second'), updated_at = now() "
             + "WHERE task_id = ? AND run_id = ? AND shard_id = ? AND shard_attempt = ? AND lease_owner = ?";
 
     private final JdbcTemplate jdbcTemplate;
@@ -162,9 +161,16 @@ public class CheckpointWriter {
         }
     }
 
-    /** lease 续约（WP-11）：仅当仍由本 worker/attempt 持有。返回 0 表示 lease 已被接管。 */
+    /**
+     * lease 续约（WP-11）：仅当仍由本 worker/attempt 持有。返回 0 表示 lease 已被接管。
+     *
+     * <p>时间源必须是 DB 的 {@code now()}：{@code ACQUIRE_LEASE} 也写 {@code now()}。若这里传 JVM 本地
+     * {@code Timestamp}，在 UTC 会话的 {@code timestamp} 列上会与 {@code now()} 相差一个时区偏移，
+     * lease 的实际过期时间被推迟数小时，崩溃后的接管失效。
+     */
     public int renewLease(String taskId, String runId, String shardId, String leaseOwner,
-                          int shardAttempt, Timestamp leaseUntil) {
-        return jdbcTemplate.update(RENEW_LEASE, leaseUntil, taskId, runId, shardId, shardAttempt, leaseOwner);
+                          int shardAttempt, long leaseSeconds) {
+        double seconds = Math.max(1L, leaseSeconds);
+        return jdbcTemplate.update(RENEW_LEASE, seconds, taskId, runId, shardId, shardAttempt, leaseOwner);
     }
 }

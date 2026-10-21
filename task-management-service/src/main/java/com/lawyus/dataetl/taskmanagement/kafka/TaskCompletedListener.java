@@ -14,7 +14,6 @@ import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
 import com.lawyus.dataetl.taskmanagement.repository.EtlTaskRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
@@ -24,26 +23,25 @@ import java.util.Optional;
 /**
  * 旧链路"任务完成"监听器（{@code task-completed}）。
  *
- * <p>影子切换（{@code orchestrator-design.md §11.2/D-25}）：
- * <ul>
- *   <li>{@code etl.routing.newWorker=false}（默认）：保持现网行为——直接写 {@code etl_task} 的 status/计数。</li>
- *   <li>{@code true}：不直写 status，改经 {@link LegacyStatusAdapter} → {@link OrchestratorService#transition}
- *       收敛到状态机唯一入口（P2）。run 缺失或已终态则跳过（results 路径通常已先行收敛）。</li>
- * </ul>
+ * <p>影子切换（{@code orchestrator-design.md §11.2/D-25}）：任务所属 dataSource 未命中灰度白名单时走旧链路直写；
+ * 命中白名单时经 {@link LegacyStatusAdapter} → {@link OrchestratorService#transition} 收敛到状态机唯一入口（P2）。
+ * run 缺失或已终态则跳过（results 路径通常已先行收敛）。
  */
 @Component
 public class TaskCompletedListener {
     private static final Logger log = LoggerFactory.getLogger(TaskCompletedListener.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final EtlTaskRepository etlTaskRepository;
+    private final OrchestratorService orchestrator;
+    private final RoutingProperties routing;
 
-    @Autowired
-    private EtlTaskRepository etlTaskRepository;
-
-    @Autowired
-    private OrchestratorService orchestrator;
-
-    @Autowired
-    private RoutingProperties routing;
+    public TaskCompletedListener(EtlTaskRepository etlTaskRepository,
+                                 OrchestratorService orchestrator,
+                                 RoutingProperties routing) {
+        this.etlTaskRepository = etlTaskRepository;
+        this.orchestrator = orchestrator;
+        this.routing = routing;
+    }
 
     @KafkaListener(topics = "${etl.topics.task-completed}", groupId = "task-management-group")
     public void listenTaskCompleted(String taskCompletedMessage) {
@@ -54,10 +52,16 @@ public class TaskCompletedListener {
             long totalRecords = rootNode.path("totalRecords").asLong();
 
             if (taskId != null && !taskId.isEmpty()) {
-                if (routing.isNewWorker()) {
+                EtlTask task = etlTaskRepository.findByTaskId(taskId);
+                if (task == null) {
+                    log.warn("task-completed: task not found task={}", taskId);
+                    return;
+                }
+                // 灰度按 dataSource 白名单判定：白名单外任务仍走旧链路直写
+                if (routing.isNewWorkerFor(task.getDataSourceId())) {
                     routeToStateMachine(taskId);
                 } else {
-                    updateTaskStatus(taskId, completedRecords, totalRecords);
+                    updateTaskStatus(task, completedRecords, totalRecords);
                 }
             }
         } catch (Exception e) {
@@ -95,7 +99,10 @@ public class TaskCompletedListener {
         if (task == null) {
             throw new RuntimeException("Task not found with taskId " + taskId);
         }
+        updateTaskStatus(task, completedRecords, totalRecords);
+    }
 
+    private void updateTaskStatus(EtlTask task, long completedRecords, long totalRecords) {
         // 更新数据库中的完成记录数
         task.setTotalRecords(totalRecords);
         task.setEndTime(new Date());

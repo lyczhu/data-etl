@@ -77,11 +77,12 @@ etl:
     shard-max-total: 5000
     shard-chunk-size: 5000
     shard-target-count: 16
-  # 新旧链路灰度路由（§11.2/§11.4）；默认关闭 = 新链路(pump/Progress·Results·Dlt)休眠，旧链路行为不变
+  # 新旧链路灰度路由（§11.2/§11.4）
   routing:
-    new-worker: false
-    shadow-compare: false
-    # WP-16：灰度白名单；为空 = 全部 dataSource 走新链路，非空只放行列出的 dataSourceId
+    new-worker: true
+    shadow-compare: true
+    # Phase 1C 收口（2026-10-21）：S1/S2/S3 接入测试全过，白名单清空 = 全部 dataSource 走新链路；
+    # 回滚只需 new-worker=false（旧链路恢复独占）。
     data-source-whitelist: []
 
 management:

@@ -76,15 +76,17 @@ class CheckpointWriterSqlTest {
     }
 
     @Test
-    @DisplayName("renewLease 仅在本 attempt + owner 仍持有时更新")
+    @DisplayName("renewLease 用 DB now() 续约，且仅在本 attempt + owner 仍持有时更新")
     void renewLeaseIsFencedByAttemptAndOwner() {
-        writer.renewLease("task-1", "run-1", "shard-0", "worker-a", 2,
-                new java.sql.Timestamp(System.currentTimeMillis() + 60_000));
+        writer.renewLease("task-1", "run-1", "shard-0", "worker-a", 2, 60);
 
         assertThat(jdbcTemplate.sqls).hasSize(1);
         String sql = jdbcTemplate.sqls.get(0);
-        assertThat(sql).contains("shard_attempt = ?").contains("lease_owner = ?");
-        assertThat(jdbcTemplate.args.get(0)).containsSequence("task-1", "run-1", "shard-0", 2, "worker-a");
+        // 时间源必须是 DB now()：JVM Timestamp 在 UTC 会话下会引入时区偏移，接管被推迟数小时
+        assertThat(sql).contains("lease_until = now() + (? * interval '1 second')")
+                .contains("shard_attempt = ?").contains("lease_owner = ?");
+        assertThat(jdbcTemplate.args.get(0))
+                .containsSequence(60.0d, "task-1", "run-1", "shard-0", 2, "worker-a");
     }
 
     /** 不触库：只截获 SQL/参数，验证 SQL 契约。 */

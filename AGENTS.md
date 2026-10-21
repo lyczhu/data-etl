@@ -59,8 +59,9 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
   `AllowedTransitions` (**exactly 32**, locked by `AllowedTransitionsTest`); a new/changed transition must be applied to
   `AllowedTransitions`, the §5.1 table in `orchestrator-design.md`, and `target-lifecycle-states.dot` (then re-render SVG)
   together.
-- `EtlTask.status` stays a `String` (front-end + `findByStatus` contract) and is a read-only projection of the current
-  run's status via `refreshDerivedStatus` (INV-6). Never write it from outside the transition path.
+- `EtlTask.status` stays a `String` (front-end + `findByStatus` contract). For new-chain tasks it is a read-only
+  projection of the current run's status via `refreshDerivedStatus` (INV-6); never write it outside the transition path.
+  Legacy `TaskCompletedListener`/`TaskFailedListener` may direct-write only for dataSources outside the gray whitelist.
 - Storage batch consumer (`data-storage-service`): a batch listener must **record-and-skip** unparseable messages (Poison
   Guard) and must never throw to retry the whole batch — that causes an infinite poison loop. Real DLT isolation is a
   later phase.
@@ -87,8 +88,18 @@ human-oriented background lives in `README.md` and `docs/architecture/`.
   `pg_advisory_xact_lock(hashtext('etl:dispatch:permits'))` so multiple orchestrators cannot overshoot the same free slot.
 - Target-table DDL belongs to **V-3** (`TargetTableManager`): one-time create plus `idempotency_key` UNIQUE under a target-DB
   advisory lock. Workers must not call `ensureTargetTable` per shard; a failed V-3 becomes `FAILED(TARGET_UNWRITABLE)`.
-- `etl.routing.new-worker` stays **false** until all Gate 2 evidence exists (multi-JVM orchestrator, real alert firing,
-  rollback drill). Phase 1B code being green is not sufficient to flip it.
+- Gray routing is **per dataSource**: every route decision uses `RoutingProperties.isNewWorkerFor(dataSourceId)`, never the
+  global `isNewWorker()`. `new-worker=true` is allowed only with a non-empty `data-source-whitelist`; legacy terminal
+  listeners (`TaskCompletedListener`/`TaskFailedListener`) must use the per-dataSource check too. A non-whitelisted task has
+  no run row, so a global gate strands it in `running` (caught in Phase 1C).
+- `etl.routing.new-worker` stays **false** unless Gate 2 evidence exists (multi-JVM orchestrator, real alert firing,
+  rollback drill). Phase 1C closed on 2026-10-21 with an **empty** `data-source-whitelist` (empty = every dataSource
+  uses the new chain) after the S1/S2/S3 Gate 3 runs; rollback is `new-worker=false`, which returns the old chain
+  exclusively. Any future staged rollout needs one passing Gate 3 acceptance run
+  (`test-scripts/phase1c-acceptance-check.sql`, 8 checks) per dataSource/table — not calendar observation.
+- Lease expiry is a **database** fact: `CheckpointWriter` writes `lease_until` as `now() + interval` on both acquire
+  and renew. A JVM `Timestamp` lands in a `timestamp without time zone` column and is compared against `now()`
+  (timestamptz) with a timezone offset, delaying takeover by hours; the Phase 1C S3 kill drill caught an 8-hour skew.
 
 ## Toolchain
 
