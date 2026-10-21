@@ -21,6 +21,7 @@
         <kafka.version>3.3.2</kafka.version>
         <redis.version>3.2.11</redis.version>
         <postgresql.version>42.7.9</postgresql.version>
+        <mysql.version>8.0.33</mysql.version>
         <lombok.version>1.18.40</lombok.version>
 
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -75,6 +76,13 @@
                 <groupId>org.postgresql</groupId>
                 <artifactId>postgresql</artifactId>
                 <version>${postgresql.version}</version>
+            </dependency>
+
+            <!-- MySQL（Phase 2A 真库回归；新坐标 mysql-connector-j） -->
+            <dependency>
+                <groupId>com.mysql</groupId>
+                <artifactId>mysql-connector-j</artifactId>
+                <version>${mysql.version}</version>
             </dependency>
 
             <!-- Lombok -->

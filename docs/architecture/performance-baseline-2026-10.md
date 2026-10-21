@@ -188,3 +188,43 @@ SHOW PROCESSLIST;
 - 这张表是 **Phase 1A 的对照基线**；Phase 1A 结束后用同一口径复测，不能换统计窗口或只挑成功任务。
 - 如果采集时 `newWorker=true`，必须标注；该数据不能与 `newWorker=false` 基线直接比较。
 - 没有基线的“P95 降 40%”不成立；Gate 1 只接受同口径的前后对比。
+
+---
+
+## 9. Phase 2A 容量基线（待执行，2026-10-21 起）
+
+Phase 1A 遗留的 30M 行 / >100 分片 / 20 并发任务压测在此小节归档。执行入口：
+
+```powershell
+# 1) 造数：30M 行主表 + 100k 行并发表（会 DROP 重建，仅测试环境）
+Get-Content test-scripts/phase2-load-30m.sql -Raw | docker exec -i postgres psql -U postgres -d etl_system -v ON_ERROR_STOP=1
+
+# 2) 建 1 个 30M 任务 + 20 个 100k 并发任务
+pwsh -File test-scripts/phase2-load-create-tasks.ps1 -DataSourceId <sz-data-id>
+
+# 3) 采集（GC / Kafka lag / PG 连接数 / 终态 / 目标行数）
+pwsh -File test-scripts/phase2-load-run.ps1 -DataSourceId <sz-data-id> -SkipSql
+```
+
+| 字段 | 值 |
+|---|---|
+| 采集时间 | 待填 |
+| Git commit | 待填 |
+| 规模 | 1 × 30,000,000 行（≥100 分片）；20 × 100,000 行并发 |
+| P50 / P95 / P99（秒） | 待填 |
+| 吞吐（行/秒） | 待填 |
+| Full GC 次数 / 总停顿 / 最大停顿 | 待填（8082 + 8087） |
+| Kafka lag 峰值 | 待填 |
+| PG 连接峰值 | 待填 |
+| 失败/卡死/孤儿 run | 待填（目标 0） |
+| 目标行数 = 源行数 | 待填（逐任务） |
+| 容量结论 | 待填（不能通过时写“可解释容量上限”） |
+
+故障注入另表归档：
+
+```powershell
+pwsh -File test-scripts/phase2-fault-injection.ps1 -DataSourceId <sz-data-id> -Target worker -Rounds 3
+pwsh -File test-scripts/phase2-fault-injection.ps1 -DataSourceId <sz-data-id> -Target orchestrator -Rounds 3
+```
+
+判定口径：worker/orchestrator `kill -9` 后由 lease 接管续跑，目标行数 = 源行数、无重复、无孤儿 run；Kafka 重启后能恢复消费。

@@ -56,6 +56,16 @@ public final class ItInfra {
     public static final String REDIS_HOST = "localhost";
     public static final int REDIS_PORT = 6379;
 
+    /** Phase 2A：MySQL 8.0 回归实例（docker compose --profile mysql up -d mysql，使用本地镜像）。 */
+    public static final String MYSQL_HOST = "localhost";
+    public static final int MYSQL_PORT = 3307;
+    public static final String MYSQL_USER = "etl";
+    public static final String MYSQL_PASSWORD = "etl";
+    public static final String MYSQL_DB = "etl_it_mysql";
+    public static final String MYSQL_URL = "jdbc:mysql://" + MYSQL_HOST + ":" + MYSQL_PORT + "/" + MYSQL_DB
+            + "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8";
+    public static final String MYSQL_DRIVER = "com.mysql.cj.jdbc.Driver";
+
     /** IT 源表（真 JDBC 读取目标）：20 行整型主键 1..20，含数值/文本/时间戳列。 */
     public static final String SOURCE_TABLE = "it_source_order";
     public static final int SOURCE_ROWS = 20;
@@ -81,8 +91,8 @@ public final class ItInfra {
     public static final String WORKER_GROUP = RUN_TAG + "-etl-worker";
 
     private static final String[] SCHEMA_SCRIPTS = {
-            "02-create-tables.sql", "05-etl-task-run.sql", "06-etl-task-checkpoint.sql",
-            "07-etl-task-dlt.sql"};
+            "00-extensions.sql", "02-create-tables.sql", "05-etl-task-run.sql",
+            "06-etl-task-checkpoint.sql", "07-etl-task-dlt.sql"};
 
     private static final AtomicBoolean BOOTSTRAPPED = new AtomicBoolean(false);
 
@@ -101,6 +111,13 @@ public final class ItInfra {
         Assumptions.assumeTrue(tcpOpen(REDIS_HOST, REDIS_PORT),
                 "跳过：Redis 未就绪，" + REDIS_HOST + ":" + REDIS_PORT + " 不可达（docker compose up -d redis）");
         bootstrapOnce();
+    }
+
+    /** MySQL 回归实例是否就绪；未启动时相关 IT 跳过而非失败。 */
+    public static void assumeMySqlUp() {
+        Assumptions.assumeTrue(tcpOpen(MYSQL_HOST, MYSQL_PORT),
+                "跳过：MySQL 未就绪，" + MYSQL_HOST + ":" + MYSQL_PORT
+                        + " 不可达（docker compose --profile mysql up -d mysql）");
     }
 
     /** 建库 + 落 DDL + 清残数据 + 重建源表；同一 JVM 只做一次。 */

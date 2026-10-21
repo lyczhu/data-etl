@@ -67,6 +67,27 @@ services:
       timeout: 5s
       retries: 5
 
+  # MySQL 8.0：Phase 2A 的 MySQL→PG 真库回归用（使用本地已有镜像，避免联网拉取）。
+  # 默认不启动，需要时执行：docker compose --profile mysql up -d mysql
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    profiles: ["mysql"]
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=etl_it_mysql
+      - MYSQL_USER=etl
+      - MYSQL_PASSWORD=etl
+    ports:
+      - "3307:3306"
+    networks:
+      - etl_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # Redis 缓存
   redis:
     image: redis:8.2
