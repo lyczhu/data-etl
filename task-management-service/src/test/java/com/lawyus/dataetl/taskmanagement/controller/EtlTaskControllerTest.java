@@ -1,6 +1,8 @@
 package com.lawyus.dataetl.taskmanagement.controller;
 
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorCommandService;
+import com.lawyus.dataetl.taskmanagement.orchestrator.audit.AuditService;
+import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskAudit;
 import com.lawyus.dataetl.taskmanagement.service.EtlTaskService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -10,6 +12,9 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import java.util.Date;
+import java.util.List;
+
+import org.springframework.data.domain.PageImpl;
 
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -28,6 +33,7 @@ class EtlTaskControllerTest {
     private EtlTaskController controller;
     private EtlTaskService taskService;
     private OrchestratorCommandService commandService;
+    private AuditService auditService;
     private MockMvc mvc;
 
     @BeforeEach
@@ -35,8 +41,10 @@ class EtlTaskControllerTest {
         controller = new EtlTaskController();
         taskService = mock(EtlTaskService.class);
         commandService = mock(OrchestratorCommandService.class);
+        auditService = mock(AuditService.class);
         ReflectionTestUtils.setField(controller, "etlTaskService", taskService);
         ReflectionTestUtils.setField(controller, "commandService", commandService);
+        ReflectionTestUtils.setField(controller, "auditService", auditService);
         mvc = MockMvcBuilders.standaloneSetup(controller).build();
     }
 
@@ -57,6 +65,23 @@ class EtlTaskControllerTest {
                 .andExpect(jsonPath("$.status").value("RUNNING"))
                 .andExpect(jsonPath("$.shardTotal").value(3))
                 .andExpect(jsonPath("$.running").value(2));
+    }
+
+    @Test
+    @DisplayName("GET /audit 返回审计分页；task 不存在 → 404")
+    void auditReturnsPageAndMapsNotFound() throws Exception {
+        EtlTaskAudit audit = EtlTaskAudit.record("t1", "r1", "CREATED", "VALIDATED",
+                "it", "VALIDATED", null, null);
+        when(auditService.page("t1", 0, 50)).thenReturn(new PageImpl<>(List.of(audit)));
+        mvc.perform(get("/api/tasks/t1/audit"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content[0].toStatus").value("VALIDATED"))
+                .andExpect(jsonPath("$.totalElements").value(1));
+
+        when(auditService.page("missing", 0, 50))
+                .thenThrow(new IllegalArgumentException("task not found: missing"));
+        mvc.perform(get("/api/tasks/missing/audit"))
+                .andExpect(status().isNotFound());
     }
 
     @Test

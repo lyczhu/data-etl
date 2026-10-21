@@ -28,7 +28,7 @@ spring:
     url: jdbc:postgresql://localhost:5433/etl_it
   jpa:
     hibernate:
-      ddl-auto: update          # 表由 db/schema 02/05/06 建（含部分唯一索引/CHECK），此处仅补实体差异列
+      ddl-auto: validate        # Phase 2B：表由 db/schema 全量建出（含 08 audit），Hibernate 只校验不补列
     open-in-view: false
     properties:
       hibernate:
@@ -65,6 +65,8 @@ etl:
     results: it.etl.task.results
     dlt: it.etl.task.dlt
     commands: it.etl.task.commands
+  audit:
+    retention-days: 180
   orchestrator:
     max-attempts: 3
     dispatch-heartbeat-timeout: 100d

@@ -2,7 +2,7 @@
 
 -- 1. 数据源管理表
 CREATE TABLE IF NOT EXISTS data_source (
-    id SERIAL PRIMARY KEY,
+    id BIGSERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL, -- 数据源名称
     type VARCHAR(50) NOT NULL, -- 数据源类型，如postgresql, mysql, oracle等
     url VARCHAR(255) NOT NULL, -- 数据库连接URL
@@ -16,10 +16,10 @@ CREATE TABLE IF NOT EXISTS data_source (
 
 -- 2. ETL任务表
 CREATE TABLE IF NOT EXISTS etl_task (
-    id SERIAL PRIMARY KEY,
+    id BIGSERIAL PRIMARY KEY,
     task_id VARCHAR(64) NOT NULL UNIQUE, -- 任务UUID，全局唯一
-    data_source_id INT NOT NULL REFERENCES data_source(id) ON DELETE CASCADE, -- 关联的数据源ID，删除数据源时级联删除相关任务
-    target_data_source_id INT, -- 目标数据源ID（WP-03/D15；为空 = 写 worker 本地库）
+    data_source_id BIGINT NOT NULL REFERENCES data_source(id) ON DELETE CASCADE, -- 关联的数据源ID，删除数据源时级联删除相关任务
+    target_data_source_id BIGINT, -- 目标数据源ID（WP-03/D15；为空 = 写 worker 本地库）
     source_table_name VARCHAR(100) NOT NULL, -- 源表名称
     target_table_name VARCHAR(100) NOT NULL, -- 目标表名称
     status VARCHAR(20) NOT NULL DEFAULT 'new', -- 任务状态：new, running, completed, failed, paused
@@ -34,7 +34,22 @@ CREATE TABLE IF NOT EXISTS etl_task (
 );
 
 -- 既有库迁移（幂等）
-ALTER TABLE etl_task ADD COLUMN IF NOT EXISTS target_data_source_id INT;
+-- Phase 2B：实体主键/外键均为 Long，旧库的 SERIAL/INT 在 ddl-auto=validate 下会报类型不符。
+-- 先摘掉 FK，改类型，再恢复；重复执行安全。
+ALTER TABLE etl_task ADD COLUMN IF NOT EXISTS target_data_source_id BIGINT;
+ALTER TABLE etl_task DROP CONSTRAINT IF EXISTS etl_task_data_source_id_fkey;
+ALTER TABLE data_source ALTER COLUMN id TYPE BIGINT;
+ALTER TABLE etl_task ALTER COLUMN id TYPE BIGINT;
+ALTER TABLE etl_task ALTER COLUMN data_source_id TYPE BIGINT;
+ALTER TABLE etl_task ALTER COLUMN target_data_source_id TYPE BIGINT;
+ALTER TABLE etl_task ADD CONSTRAINT etl_task_data_source_id_fkey
+    FOREIGN KEY (data_source_id) REFERENCES data_source(id) ON DELETE CASCADE;
+ALTER SEQUENCE IF EXISTS data_source_id_seq AS BIGINT;
+ALTER SEQUENCE IF EXISTS etl_task_id_seq AS BIGINT;
+-- Phase 2B：Phase 1C 之前仅由 Hibernate ddl-auto=update 建过这两列（旧链路口径）；
+-- 新链路不填充它们（/progress 是唯一进度真源），但 ddl-auto=validate 要求列存在。
+ALTER TABLE etl_task ADD COLUMN IF NOT EXISTS total_records BIGINT DEFAULT 0;
+ALTER TABLE etl_task ADD COLUMN IF NOT EXISTS completed_records BIGINT DEFAULT 0;
 
 -- 索引创建
 CREATE INDEX IF NOT EXISTS idx_etl_task_status ON etl_task(status);

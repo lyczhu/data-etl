@@ -92,7 +92,7 @@ public final class ItInfra {
 
     private static final String[] SCHEMA_SCRIPTS = {
             "00-extensions.sql", "02-create-tables.sql", "05-etl-task-run.sql",
-            "06-etl-task-checkpoint.sql", "07-etl-task-dlt.sql"};
+            "06-etl-task-checkpoint.sql", "07-etl-task-dlt.sql", "08-etl-task-audit.sql"};
 
     private static final AtomicBoolean BOOTSTRAPPED = new AtomicBoolean(false);
 
@@ -213,8 +213,8 @@ public final class ItInfra {
                 for (String table : itTables) {
                     st.execute("DROP TABLE IF EXISTS \"" + table + "\" CASCADE");
                 }
-                st.execute("TRUNCATE TABLE data_source, etl_task, etl_task_run, etl_task_checkpoint, etl_task_dlt "
-                        + "RESTART IDENTITY CASCADE");
+                st.execute("TRUNCATE TABLE data_source, etl_task, etl_task_run, etl_task_checkpoint, "
+                        + "etl_task_dlt, etl_task_audit RESTART IDENTITY CASCADE");
             }
             seedSourceTable(conn);
         } catch (SQLException e) {

@@ -11,7 +11,8 @@ spring:
     driver-class-name: org.postgresql.Driver
   jpa:
     hibernate:
-      ddl-auto: update
+      # Phase 2B：db/schema 是唯一真源；Hibernate 不再改表，启动时只校验实体与表一致
+      ddl-auto: validate
     show-sql: true
     properties:
       hibernate:
@@ -69,6 +70,10 @@ etl:
     validated-timeout: 10s
     stall-fallback-threshold: 30m
     backoff-task-attempts: [5m, 15m, 1h]
+  # Phase 2B：状态迁移审计保留策略（INV-9）
+  audit:
+    retention-days: 180
+    retention-cron: "0 0 3 * * *"
   # 派工与背压（§5.4 / §7.2）；令牌桶容量 = max-concurrent-shards
   dispatch:
     pump-batch: 50

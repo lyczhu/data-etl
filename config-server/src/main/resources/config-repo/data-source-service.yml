@@ -11,7 +11,8 @@ spring:
     driver-class-name: org.postgresql.Driver
   jpa:
     hibernate:
-      ddl-auto: update
+      # Phase 2B：db/schema 是唯一真源；启动时只校验实体与表一致
+      ddl-auto: validate
     show-sql: false
     properties:
       hibernate:

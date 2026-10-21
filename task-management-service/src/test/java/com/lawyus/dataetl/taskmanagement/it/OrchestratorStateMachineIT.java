@@ -66,13 +66,17 @@ class OrchestratorStateMachineIT extends AbstractOrchestratorIT {
                     } else {
                         assertThat(result.statusEnum()).isEqualTo(to);
                         assertThat(runStatus(runId)).isEqualTo(to);
+                        // INV-9：每条合法边恰好一条审计（seedRun 不写审计）
+                        assertThat(auditCount(taskId)).isEqualTo(1L);
                         legalExecuted++;
                     }
                 } catch (IllegalStateTransitionException expectedIllegal) {
                     assertThat(legal).isFalse();
                     assertThat(runStatus(runId)).isEqualTo(from);   // 非法迁移不得触碰库
+                    assertThat(auditCount(taskId)).isZero();
                     illegalRejected++;
                 } catch (GuardFailureException guardBlocked) {
+                    assertThat(auditCount(taskId)).as("guard 拦截不写审计").isZero();
                     legalButBlocked.add(from + " -> " + to + " (" + guardBlocked.getGuard() + ")");
                 }
             }

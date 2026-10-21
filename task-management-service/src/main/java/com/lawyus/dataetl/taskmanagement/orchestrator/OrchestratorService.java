@@ -1,6 +1,7 @@
 package com.lawyus.dataetl.taskmanagement.orchestrator;
 
 import com.lawyus.dataetl.taskmanagement.orchestrator.entity.EtlTaskRun;
+import com.lawyus.dataetl.taskmanagement.orchestrator.audit.AuditWriter;
 import com.lawyus.dataetl.taskmanagement.orchestrator.config.OrchestratorProperties;
 import com.lawyus.dataetl.taskmanagement.orchestrator.event.DomainEventPublisher;
 import com.lawyus.dataetl.taskmanagement.orchestrator.event.EtlTaskTransitioned;
@@ -57,6 +58,7 @@ public class OrchestratorService implements OrchestratorEngine {
     private final DomainEventPublisher eventPublisher;
     private final OrchestratorProperties properties;
     private final RunCounterProjector counterProjector;
+    private final AuditWriter auditWriter;
 
     /** WP-16：可选影子比对；单测上下文无此 bean 时跳过。 */
     @Autowired(required = false)
@@ -69,7 +71,8 @@ public class OrchestratorService implements OrchestratorEngine {
                                OrchestratorMetrics metrics,
                                DomainEventPublisher eventPublisher,
                                OrchestratorProperties properties,
-                               RunCounterProjector counterProjector) {
+                               RunCounterProjector counterProjector,
+                               AuditWriter auditWriter) {
         this.runRepository = runRepository;
         this.checkpointRepository = checkpointRepository;
         this.taskRepository = taskRepository;
@@ -78,6 +81,7 @@ public class OrchestratorService implements OrchestratorEngine {
         this.eventPublisher = eventPublisher;
         this.properties = properties;
         this.counterProjector = counterProjector;
+        this.auditWriter = auditWriter;
     }
 
     /**
@@ -98,6 +102,8 @@ public class OrchestratorService implements OrchestratorEngine {
         });
         EtlTaskRun run = EtlTaskRun.newRun(UUID.randomUUID().toString(), taskId, 1);
         EtlTaskRun saved = runRepository.save(run);
+        // INV-9：新建 run 也记一条审计（(none) -> CREATED），与 run 行同事务
+        auditWriter.recordCreated(saved, "system:submit");
         taskRepository.refreshDerivedStatus(taskId, CREATED.name());
         log.info("transition run={} from=(none) to={} reason=CREATE_TASK", saved.getRunId(), CREATED);
         return saved;
@@ -146,6 +152,8 @@ public class OrchestratorService implements OrchestratorEngine {
         }
 
         applySideEffects(run, from, to, ctx);
+        // INV-9 / P7：审计与状态迁移同事务；写失败则整个迁移回滚
+        auditWriter.record(run, from, to, ctx);
 
         // INV-6：task.status 恒等于 current run.status，单向刷新
         if (ctx.taskId() != null) {

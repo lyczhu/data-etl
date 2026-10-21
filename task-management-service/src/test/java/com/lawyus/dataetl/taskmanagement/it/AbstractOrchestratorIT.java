@@ -324,6 +324,13 @@ public abstract class AbstractOrchestratorIT {
         return jdbc.queryForObject("SELECT attempt_no FROM etl_task_run WHERE run_id = ?", Integer.class, runId);
     }
 
+    /** 某 task 的审计行数（INV-9 断言用）。 */
+    protected long auditCount(String taskId) {
+        Long count = jdbc.queryForObject("SELECT COUNT(*) FROM etl_task_audit WHERE task_id = ?",
+                Long.class, taskId);
+        return count == null ? 0L : count;
+    }
+
     protected String runColumn(String runId, String column) {
         return jdbc.queryForObject("SELECT " + column + " FROM etl_task_run WHERE run_id = ?", String.class, runId);
     }

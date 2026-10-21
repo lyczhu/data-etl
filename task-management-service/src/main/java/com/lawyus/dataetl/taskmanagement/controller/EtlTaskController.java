@@ -2,6 +2,7 @@ package com.lawyus.dataetl.taskmanagement.controller;
 
 import com.lawyus.dataetl.taskmanagement.entity.EtlTask;
 import com.lawyus.dataetl.taskmanagement.orchestrator.GuardFailureException;
+import com.lawyus.dataetl.taskmanagement.orchestrator.audit.AuditService;
 import com.lawyus.dataetl.taskmanagement.orchestrator.IllegalStateTransitionException;
 import com.lawyus.dataetl.taskmanagement.orchestrator.OrchestratorCommandService;
 import com.lawyus.dataetl.taskmanagement.service.EtlTaskService;
@@ -19,6 +20,9 @@ public class EtlTaskController {
 
     @Autowired
     private OrchestratorCommandService commandService;
+
+    @Autowired
+    private AuditService auditService;
 
     @GetMapping
     public List<EtlTask> getAllTasks() {
@@ -69,6 +73,14 @@ public class EtlTaskController {
     @GetMapping("/{taskId}/failures")
     public ResponseEntity<?> failures(@PathVariable String taskId) {
         return execute(() -> ResponseEntity.ok(commandService.failures(taskId)));
+    }
+
+    /** Phase 2B：状态迁移审计（INV-9），按 id 倒序分页。 */
+    @GetMapping("/{taskId}/audit")
+    public ResponseEntity<?> audit(@PathVariable String taskId,
+                                   @RequestParam(defaultValue = "0") int page,
+                                   @RequestParam(defaultValue = "50") int size) {
+        return execute(() -> ResponseEntity.ok(auditService.page(taskId, page, size)));
     }
 
     @PostMapping("/{taskId}/cancel")
